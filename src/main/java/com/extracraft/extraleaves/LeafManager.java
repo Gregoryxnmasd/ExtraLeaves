@@ -400,8 +400,12 @@ public class LeafManager implements Listener {
             dropHandLoot(world, block.getLocation());
         }
 
-        // Bloque roto -> ya hay packet MULTI_BLOCK_CHANGE, el burst lo lanza LeavesPacketListener
-        // No hace falta lanzar otro aquí.
+        // Refuerzo visual: en mundos generados por Iris (u otros sistemas) algunas
+        // hojas no provocan packets de block change cuando se rompen (o PacketEvents
+        // podría no capturarlos). Si no repintamos inmediatamente, las hojas
+        // adyacentes pueden quedarse como azalea vanilla. Lanzamos el burst
+        // directamente para asegurar el repintado.
+        startVisualBurst(player, 12, 16);
     }
 
     @EventHandler
