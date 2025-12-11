@@ -1,0 +1,43 @@
+namespace: "extraleaves"
+
+hand-drops:
+  stick:
+    material: "STICK"
+    min: 1
+    max: 2
+    chance: 0.10
+
+  apple:
+    material: "APPLE"
+    min: 1
+    max: 1
+    chance: 0.02
+
+leaves:
+  lavender_leaves:
+    id: "lavender_leaves"
+    display-name: "&fLavender Leaves"
+    distance-id: 1
+    custom-model-data: 104001
+    texture: "lavender_leaves"
+
+  red_maple_leaves:
+    id: "red_maple_leaves"
+    display-name: "&fRed Maple Leaves"
+    distance-id: 2
+    custom-model-data: 104002
+    texture: "red_maple_leaves"
+
+  orange_maple_leaves:
+    id: "orange_maple_leaves"
+    display-name: "&fOrange Maple Leaves"
+    distance-id: 3
+    custom-model-data: 104003
+    texture: "orange_maple_leaves"
+
+  yellow_maple_leaves:
+    id: "yellow_maple_leaves"
+    display-name: "&fYellow Maple Leaves"
+    distance-id: 4
+    custom-model-data: 104004
+    texture: "yellow_maple_leaves"

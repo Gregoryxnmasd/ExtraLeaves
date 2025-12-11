@@ -1,0 +1,19 @@
+name: ExtraLeaves
+main: com.extracraft.extraleaves.ExtraLeavesPlugin
+version: 1.0.0
+api-version: "1.21"
+author: "savaduki"
+description: "Hojas custom con PacketEvents"
+
+depend:
+  - packetevents
+
+commands:
+  extraleaves:
+    description: "Comandos de ExtraLeaves"
+    usage: "/extraleaves"
+    permission: "extraleaves.use"
+
+permissions:
+  extraleaves.use:
+    default: op
