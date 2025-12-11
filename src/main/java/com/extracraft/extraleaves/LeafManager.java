@@ -400,8 +400,14 @@ public class LeafManager implements Listener {
             dropHandLoot(world, block.getLocation());
         }
 
-        // Bloque roto -> ya hay packet MULTI_BLOCK_CHANGE, el burst lo lanza LeavesPacketListener
-        // No hace falta lanzar otro aquí.
+        // Refuerzo visual: en mundos generados por Iris (u otros sistemas) algunas
+        // hojas no provocan packets de block change cuando se rompen (o PacketEvents
+        // podría no capturarlos). Para evitar flickering entre azalea y la textura
+        // custom, repintamos de forma inmediata y luego un par de ticks después,
+        // sin usar bursts continuos.
+        org.bukkit.Location center = block.getLocation();
+        repaintHostLeavesAround(center, 16);
+        Bukkit.getScheduler().runTaskLater(plugin, () -> repaintHostLeavesAround(center, 16), 2L);
     }
 
     @EventHandler
@@ -552,12 +558,20 @@ public class LeafManager implements Listener {
      * - Usa getOrDetectLeafAt => si no estaba registrada, la detecta por distance o le asigna una.
      */
     public void sendAllVisualsAround(Player player, int radius) {
-        World world = player.getWorld();
-        org.bukkit.Location base = player.getLocation();
+        repaintHostLeavesAround(player.getLocation(), radius, player);
+    }
 
-        int cx = base.getBlockX();
-        int cy = base.getBlockY();
-        int cz = base.getBlockZ();
+    private void repaintHostLeavesAround(org.bukkit.Location center, int radius) {
+        repaintHostLeavesAround(center, radius, null);
+    }
+
+    private void repaintHostLeavesAround(org.bukkit.Location center, int radius, Player onlyPlayer) {
+        World world = center.getWorld();
+        if (world == null) return;
+
+        int cx = center.getBlockX();
+        int cy = center.getBlockY();
+        int cz = center.getBlockZ();
 
         int r = radius;
         int rSq = r * r;
@@ -565,6 +579,22 @@ public class LeafManager implements Listener {
         int yRadius = Math.min(r, 16);
         int minY = Math.max(world.getMinHeight(), cy - yRadius);
         int maxY = Math.min(world.getMaxHeight() - 1, cy + yRadius);
+
+        List<Player> viewers;
+        if (onlyPlayer != null) {
+            if (!onlyPlayer.isOnline()) return;
+            viewers = Collections.singletonList(onlyPlayer);
+        } else {
+            viewers = new ArrayList<>();
+            for (Player p : world.getPlayers()) {
+                double dx = p.getLocation().getX() - center.getX();
+                double dz = p.getLocation().getZ() - center.getZ();
+                if (dx * dx + dz * dz <= rSq) {
+                    viewers.add(p);
+                }
+            }
+            if (viewers.isEmpty()) return;
+        }
 
         for (int x = cx - r; x <= cx + r; x++) {
             for (int z = cz - r; z <= cz + r; z++) {
@@ -579,7 +609,9 @@ public class LeafManager implements Listener {
                     LeafType type = getOrDetectLeafAt(world, x, y, z);
                     if (type == null) continue;
 
-                    player.sendBlockChange(block.getLocation(), type.visualData());
+                    for (Player viewer : viewers) {
+                        viewer.sendBlockChange(block.getLocation(), type.visualData());
+                    }
                 }
             }
         }
