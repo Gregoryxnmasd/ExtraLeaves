@@ -18,6 +18,7 @@ import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
 import org.bukkit.event.block.BlockBreakEvent;
 import org.bukkit.event.block.BlockPlaceEvent;
+import org.bukkit.event.block.BlockPhysicsEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.world.ChunkLoadEvent;
 import org.bukkit.event.world.ChunkUnloadEvent;
@@ -609,9 +610,7 @@ public class LeafManager implements Listener {
                     LeafType type = getOrDetectLeafAt(world, x, y, z);
                     if (type == null) continue;
 
-                    for (Player viewer : viewers) {
-                        viewer.sendBlockChange(block.getLocation(), type.visualData());
-                    }
+                    sendVisual(block, type, viewers);
                 }
             }
         }
@@ -648,6 +647,44 @@ public class LeafManager implements Listener {
         }, 0L, 1L); // delay 0L para repintar lo antes posible
 
         visualBurstTasks.put(uuid, holder[0]);
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onLeafPhysics(BlockPhysicsEvent event) {
+        Block block = event.getBlock();
+        if (block.getType() != hostMaterial) return;
+
+        LeafType type = getOrDetectLeafAt(block.getWorld(), block.getX(), block.getY(), block.getZ());
+        if (type == null) return;
+
+        sendVisual(block, type, getNearbyViewers(block.getLocation(), 32));
+    }
+
+    private List<Player> getNearbyViewers(org.bukkit.Location center, int radius) {
+        World world = center.getWorld();
+        if (world == null) return Collections.emptyList();
+
+        int rSq = radius * radius;
+        List<Player> viewers = new ArrayList<>();
+        for (Player player : world.getPlayers()) {
+            if (!player.isOnline()) continue;
+            double dx = player.getLocation().getX() - center.getX();
+            double dz = player.getLocation().getZ() - center.getZ();
+            if (dx * dx + dz * dz <= rSq) {
+                viewers.add(player);
+            }
+        }
+        return viewers;
+    }
+
+    private void sendVisual(Block block, LeafType type, Collection<Player> viewers) {
+        if (viewers == null || viewers.isEmpty()) return;
+        org.bukkit.Location loc = block.getLocation();
+        for (Player viewer : viewers) {
+            if (viewer.isOnline()) {
+                viewer.sendBlockChange(loc, type.visualData());
+            }
+        }
     }
 
     private void rebuildLoadedChunks() {
