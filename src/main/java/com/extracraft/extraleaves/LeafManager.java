@@ -3,6 +3,7 @@ package com.extracraft.extraleaves;
 import org.bukkit.Bukkit;
 import org.bukkit.ChatColor;
 import org.bukkit.Chunk;
+import org.bukkit.Location;
 import org.bukkit.Material;
 import org.bukkit.NamespacedKey;
 import org.bukkit.World;
@@ -18,6 +19,7 @@ import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
 import org.bukkit.event.block.BlockBreakEvent;
 import org.bukkit.event.block.BlockPlaceEvent;
+import org.bukkit.event.block.BlockPhysicsEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.world.ChunkLoadEvent;
 import org.bukkit.event.world.ChunkUnloadEvent;
@@ -42,6 +44,9 @@ public class LeafManager implements Listener {
 
     private final ExtraLeavesPlugin plugin;
 
+    private static final int RESKIN_VIEW_RADIUS = 32;
+    private static final int MAX_RESENDS_PER_TICK = 800;
+
     // Bloque host real (Iris + plugin usan AZALEA_LEAVES)
     private final Material hostMaterial = Material.AZALEA_LEAVES;
 
@@ -55,6 +60,9 @@ public class LeafManager implements Listener {
 
     // ChunkKey -> (BlockPos -> LeafType)
     private final Map<ChunkKey, Map<BlockPos, LeafType>> leavesByChunk = new HashMap<>();
+
+    // Cola de posiciones que necesitan repintado repetido durante unos ticks
+    private final Map<BlockKey, Integer> reskinQueue = new HashMap<>();
 
     // Drops al romper con la mano
     private static class HandDrop {
@@ -79,6 +87,7 @@ public class LeafManager implements Listener {
     // Claves auxiliares para map
     private record ChunkKey(UUID worldId, int x, int z) {}
     private record BlockPos(int x, int y, int z) {}
+    private record BlockKey(UUID worldId, int x, int y, int z) {}
 
     public LeafManager(ExtraLeavesPlugin plugin) {
         this.plugin = plugin;
@@ -92,6 +101,9 @@ public class LeafManager implements Listener {
 
         // Reconstruir datos persistidos (hojas colocadas antes del restart)
         Bukkit.getScheduler().runTask(plugin, this::rebuildLoadedChunks);
+
+        // Reloj ligero para procesar la cola de repintados sin burst masivos
+        Bukkit.getScheduler().runTaskTimer(plugin, this::processReskinQueue, 1L, 2L);
     }
 
     // ==================== CONFIG ====================
@@ -400,8 +412,11 @@ public class LeafManager implements Listener {
             dropHandLoot(world, block.getLocation());
         }
 
-        // Bloque roto -> ya hay packet MULTI_BLOCK_CHANGE, el burst lo lanza LeavesPacketListener
-        // No hace falta lanzar otro aquí.
+        // Estabilización optimizada: repintamos solo las hojas registradas cercanas y
+        // las mantenemos en la cola durante unos ticks para cubrir los recalculos de distance.
+        org.bukkit.Location center = block.getLocation();
+        repaintHostLeavesAround(center, 14, null);
+        queueRegisteredLeavesAround(center, 14, 18);
     }
 
     @EventHandler
@@ -542,6 +557,51 @@ public class LeafManager implements Listener {
         }
     }
 
+    private void queueReskin(Block block, int durationTicks) {
+        queueReskin(block.getWorld(), block.getX(), block.getY(), block.getZ(), durationTicks);
+    }
+
+    private void queueReskin(World world, int x, int y, int z, int durationTicks) {
+        if (durationTicks <= 0 || world == null) return;
+        BlockKey key = new BlockKey(world.getUID(), x, y, z);
+        reskinQueue.merge(key, durationTicks, Math::max);
+    }
+
+    private void queueRegisteredLeavesAround(org.bukkit.Location center, int radius, int durationTicks) {
+        World world = center.getWorld();
+        if (world == null || radius <= 0 || durationTicks <= 0) return;
+
+        int cx = center.getBlockX();
+        int cy = center.getBlockY();
+        int cz = center.getBlockZ();
+
+        int r = radius;
+        int rSq = r * r;
+        int minY = Math.max(world.getMinHeight(), cy - r);
+        int maxY = Math.min(world.getMaxHeight() - 1, cy + r);
+
+        int minChunkX = (cx - r) >> 4;
+        int maxChunkX = (cx + r) >> 4;
+        int minChunkZ = (cz - r) >> 4;
+        int maxChunkZ = (cz + r) >> 4;
+
+        for (int chunkX = minChunkX; chunkX <= maxChunkX; chunkX++) {
+            for (int chunkZ = minChunkZ; chunkZ <= maxChunkZ; chunkZ++) {
+                Map<BlockPos, LeafType> chunkMap = leavesByChunk.get(new ChunkKey(world.getUID(), chunkX, chunkZ));
+                if (chunkMap == null || chunkMap.isEmpty()) continue;
+
+                for (BlockPos pos : chunkMap.keySet()) {
+                    int dx = pos.x() - cx;
+                    int dz = pos.z() - cz;
+                    if (dx * dx + dz * dz > rSq) continue;
+                    if (pos.y() < minY || pos.y() > maxY) continue;
+
+                    queueReskin(world, pos.x(), pos.y(), pos.z(), durationTicks);
+                }
+            }
+        }
+    }
+
     // ==================== VISUALES ====================
 
     /**
@@ -552,12 +612,21 @@ public class LeafManager implements Listener {
      * - Usa getOrDetectLeafAt => si no estaba registrada, la detecta por distance o le asigna una.
      */
     public void sendAllVisualsAround(Player player, int radius) {
-        World world = player.getWorld();
-        org.bukkit.Location base = player.getLocation();
+        repaintHostLeavesAround(player.getLocation(), radius, player);
+    }
 
-        int cx = base.getBlockX();
-        int cy = base.getBlockY();
-        int cz = base.getBlockZ();
+    /**
+     * Tras una rotura forzada por Iris, Mojang recalcula distances durante varios ticks
+     * y puede mandar múltiples block-changes vanilla. Este estabilizador reaplica la
+     * textura custom cada "intervalTicks" mientras dure la ventana de "durationTicks".
+     */
+    private void repaintHostLeavesAround(org.bukkit.Location center, int radius, Player onlyPlayer) {
+        World world = center.getWorld();
+        if (world == null) return;
+
+        int cx = center.getBlockX();
+        int cy = center.getBlockY();
+        int cz = center.getBlockZ();
 
         int r = radius;
         int rSq = r * r;
@@ -566,20 +635,43 @@ public class LeafManager implements Listener {
         int minY = Math.max(world.getMinHeight(), cy - yRadius);
         int maxY = Math.min(world.getMaxHeight() - 1, cy + yRadius);
 
-        for (int x = cx - r; x <= cx + r; x++) {
-            for (int z = cz - r; z <= cz + r; z++) {
-                int dx = x - cx;
-                int dz = z - cz;
-                if (dx * dx + dz * dz > rSq) continue;
+        List<Player> viewers;
+        if (onlyPlayer != null) {
+            if (!onlyPlayer.isOnline()) return;
+            viewers = Collections.singletonList(onlyPlayer);
+        } else {
+            viewers = new ArrayList<>();
+            for (Player p : world.getPlayers()) {
+                double dx = p.getLocation().getX() - center.getX();
+                double dz = p.getLocation().getZ() - center.getZ();
+                if (dx * dx + dz * dz <= rSq) {
+                    viewers.add(p);
+                }
+            }
+            if (viewers.isEmpty()) return;
+        }
 
-                for (int y = minY; y <= maxY; y++) {
-                    Block block = world.getBlockAt(x, y, z);
+        int minChunkX = (cx - r) >> 4;
+        int maxChunkX = (cx + r) >> 4;
+        int minChunkZ = (cz - r) >> 4;
+        int maxChunkZ = (cz + r) >> 4;
+
+        for (int chunkX = minChunkX; chunkX <= maxChunkX; chunkX++) {
+            for (int chunkZ = minChunkZ; chunkZ <= maxChunkZ; chunkZ++) {
+                Map<BlockPos, LeafType> chunkMap = leavesByChunk.get(new ChunkKey(world.getUID(), chunkX, chunkZ));
+                if (chunkMap == null || chunkMap.isEmpty()) continue;
+
+                for (Map.Entry<BlockPos, LeafType> entry : chunkMap.entrySet()) {
+                    BlockPos pos = entry.getKey();
+                    int dx = pos.x() - cx;
+                    int dz = pos.z() - cz;
+                    if (dx * dx + dz * dz > rSq) continue;
+                    if (pos.y() < minY || pos.y() > maxY) continue;
+
+                    Block block = world.getBlockAt(pos.x(), pos.y(), pos.z());
                     if (block.getType() != hostMaterial) continue;
 
-                    LeafType type = getOrDetectLeafAt(world, x, y, z);
-                    if (type == null) continue;
-
-                    player.sendBlockChange(block.getLocation(), type.visualData());
+                    sendVisual(block, entry.getValue(), viewers);
                 }
             }
         }
@@ -616,6 +708,84 @@ public class LeafManager implements Listener {
         }, 0L, 1L); // delay 0L para repintar lo antes posible
 
         visualBurstTasks.put(uuid, holder[0]);
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onLeafPhysics(BlockPhysicsEvent event) {
+        Block block = event.getBlock();
+        if (block.getType() != hostMaterial) return;
+
+        LeafType type = getOrDetectLeafAt(block.getWorld(), block.getX(), block.getY(), block.getZ());
+        if (type == null) return;
+
+        queueReskin(block, 12);
+        sendVisual(block, type, getNearbyViewers(block.getLocation(), RESKIN_VIEW_RADIUS));
+    }
+
+    private List<Player> getNearbyViewers(org.bukkit.Location center, int radius) {
+        World world = center.getWorld();
+        if (world == null) return Collections.emptyList();
+
+        int rSq = radius * radius;
+        List<Player> viewers = new ArrayList<>();
+        for (Player player : world.getPlayers()) {
+            if (!player.isOnline()) continue;
+            double dx = player.getLocation().getX() - center.getX();
+            double dz = player.getLocation().getZ() - center.getZ();
+            if (dx * dx + dz * dz <= rSq) {
+                viewers.add(player);
+            }
+        }
+        return viewers;
+    }
+
+    private void sendVisual(Block block, LeafType type, Collection<Player> viewers) {
+        if (viewers == null || viewers.isEmpty()) return;
+        org.bukkit.Location loc = block.getLocation();
+        for (Player viewer : viewers) {
+            if (viewer.isOnline()) {
+                viewer.sendBlockChange(loc, type.visualData());
+            }
+        }
+    }
+
+    private void processReskinQueue() {
+        if (reskinQueue.isEmpty()) return;
+
+        int processed = 0;
+        Iterator<Map.Entry<BlockKey, Integer>> it = reskinQueue.entrySet().iterator();
+        while (it.hasNext() && processed < MAX_RESENDS_PER_TICK) {
+            Map.Entry<BlockKey, Integer> entry = it.next();
+            BlockKey key = entry.getKey();
+            World world = Bukkit.getWorld(key.worldId());
+            if (world == null) {
+                it.remove();
+                continue;
+            }
+
+            Block block = world.getBlockAt(key.x(), key.y(), key.z());
+            if (block.getType() != hostMaterial) {
+                it.remove();
+                continue;
+            }
+
+            LeafType type = getOrDetectLeafAt(world, key.x(), key.y(), key.z());
+            if (type == null) {
+                it.remove();
+                continue;
+            }
+
+            sendVisual(block, type, getNearbyViewers(block.getLocation(), RESKIN_VIEW_RADIUS));
+
+            int remaining = entry.getValue() - 2; // reloj cada 2 ticks
+            if (remaining <= 0) {
+                it.remove();
+            } else {
+                entry.setValue(remaining);
+            }
+
+            processed++;
+        }
     }
 
     private void rebuildLoadedChunks() {
