@@ -3,6 +3,7 @@ package com.extracraft.extraleaves;
 import org.bukkit.Bukkit;
 import org.bukkit.ChatColor;
 import org.bukkit.Chunk;
+import org.bukkit.Location;
 import org.bukkit.Material;
 import org.bukkit.NamespacedKey;
 import org.bukkit.World;
@@ -11,13 +12,13 @@ import org.bukkit.block.data.BlockData;
 import org.bukkit.block.data.type.Leaves;
 import org.bukkit.configuration.ConfigurationSection;
 import org.bukkit.configuration.file.FileConfiguration;
-import org.bukkit.enchantments.Enchantment;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
 import org.bukkit.event.block.BlockBreakEvent;
 import org.bukkit.event.block.BlockPlaceEvent;
+import org.bukkit.event.block.BlockPhysicsEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.world.ChunkLoadEvent;
 import org.bukkit.event.world.ChunkUnloadEvent;
@@ -36,7 +37,7 @@ import java.util.concurrent.ThreadLocalRandom;
  *  - registro de posiciones de hojas custom por chunk (para drops, memoria, etc.)
  *  - integración con Iris (escanear chunks)
  *  - drops al romper
- *  - repintado visual (sendAllVisualsAround + bursts hardcodeados)
+ *  - estabilidad visual (bloqueo de physics + estado persistente)
  */
 public class LeafManager implements Listener {
 
@@ -53,8 +54,8 @@ public class LeafManager implements Listener {
     private final Map<String, LeafType> byId = new HashMap<>();
     private final Map<Integer, LeafType> byDistance = new HashMap<>();
 
-    // ChunkKey -> (BlockPos -> LeafType)
-    private final Map<ChunkKey, Map<BlockPos, LeafType>> leavesByChunk = new HashMap<>();
+    // ChunkKey -> (BlockKey -> LeafEntry)
+    private final Map<ChunkKey, Map<BlockKey, LeafEntry>> leavesByChunk = new HashMap<>();
 
     // Drops al romper con la mano
     private static class HandDrop {
@@ -73,12 +74,10 @@ public class LeafManager implements Listener {
 
     private final List<HandDrop> handDrops = new ArrayList<>();
 
-    // Tareas de bursts visuales por jugador
-    private final Map<UUID, Integer> visualBurstTasks = new HashMap<>();
-
     // Claves auxiliares para map
     private record ChunkKey(UUID worldId, int x, int z) {}
-    private record BlockPos(int x, int y, int z) {}
+    private record BlockKey(int x, int y, int z) {}
+    private record LeafEntry(LeafType type, boolean persistent) {}
 
     public LeafManager(ExtraLeavesPlugin plugin) {
         this.plugin = plugin;
@@ -248,54 +247,81 @@ public class LeafManager implements Listener {
         return new ChunkKey(chunk.getWorld().getUID(), chunk.getX(), chunk.getZ());
     }
 
-    private BlockPos blockPos(Block block) {
-        return new BlockPos(block.getX(), block.getY(), block.getZ());
+    private BlockKey blockPos(Block block) {
+        return new BlockKey(block.getX(), block.getY(), block.getZ());
     }
 
-    private Map<BlockPos, LeafType> getOrCreateChunkMap(ChunkKey key) {
-        return leavesByChunk.computeIfAbsent(key, k -> new HashMap<>());
-    }
 
-    private void setLeafAt(World world, int x, int y, int z, LeafType type) {
-        Chunk chunk = world.getChunkAt(x >> 4, z >> 4);
+    private Map<BlockKey, LeafEntry> getChunkMap(Chunk chunk) {
         ChunkKey key = chunkKey(chunk);
-        Map<BlockPos, LeafType> map = getOrCreateChunkMap(key);
-        map.put(new BlockPos(x, y, z), type);
-        saveChunkData(chunk, map);
+        Map<BlockKey, LeafEntry> existing = leavesByChunk.get(key);
+        if (existing != null) {
+            return existing;
+        }
+
+        Map<BlockKey, LeafEntry> loaded = loadChunkData(chunk);
+        leavesByChunk.put(key, loaded);
+        return loaded;
+    }
+
+    private void setLeafAt(Block block, LeafType type, boolean persistent, boolean savePersistentChanges) {
+        Chunk chunk = block.getChunk();
+        Map<BlockKey, LeafEntry> map = getChunkMap(chunk);
+        BlockKey pos = blockPos(block);
+
+        LeafEntry previous = map.put(pos, new LeafEntry(type, persistent));
+        applyLeafState(block, type);
+
+        if (!savePersistentChanges) {
+            return;
+        }
+
+        boolean previousPersistent = previous != null && previous.persistent();
+        if (persistent || previousPersistent) {
+            saveChunkData(chunk, map);
+        }
     }
 
     private void registerLeafAt(Block block, LeafType type) {
-        setLeafAt(block.getWorld(), block.getX(), block.getY(), block.getZ(), type);
+        setLeafAt(block, type, true, true);
     }
 
     private void unregisterLeafAt(Block block) {
         Chunk chunk = block.getChunk();
-        ChunkKey key = chunkKey(chunk);
-        Map<BlockPos, LeafType> map = leavesByChunk.get(key);
+        Map<BlockKey, LeafEntry> map = leavesByChunk.get(chunkKey(chunk));
         if (map == null) return;
-        map.remove(blockPos(block));
-        saveChunkData(chunk, map);
+
+        LeafEntry removed = map.remove(blockPos(block));
+        if (removed != null && removed.persistent()) {
+            saveChunkData(chunk, map);
+        }
     }
 
-    private void saveChunkData(Chunk chunk, Map<BlockPos, LeafType> map) {
+    private void saveChunkData(Chunk chunk, Map<BlockKey, LeafEntry> map) {
         PersistentDataContainer pdc = chunk.getPersistentDataContainer();
 
-        if (map == null || map.isEmpty()) {
+        if (map == null) {
             pdc.remove(chunkDataKey);
             return;
         }
 
         StringBuilder sb = new StringBuilder();
-        for (Map.Entry<BlockPos, LeafType> e : map.entrySet()) {
-            BlockPos pos = e.getKey();
-            LeafType type = e.getValue();
+        for (Map.Entry<BlockKey, LeafEntry> e : map.entrySet()) {
+            LeafEntry entry = e.getValue();
+            if (!entry.persistent()) continue;
+
+            BlockKey pos = e.getKey();
             sb.append(pos.x()).append(",")
                     .append(pos.y()).append(",")
                     .append(pos.z()).append(":")
-                    .append(type.id()).append(";");
+                    .append(entry.type().id()).append(";");
         }
 
-        pdc.set(chunkDataKey, PersistentDataType.STRING, sb.toString());
+        if (sb.length() == 0) {
+            pdc.remove(chunkDataKey);
+        } else {
+            pdc.set(chunkDataKey, PersistentDataType.STRING, sb.toString());
+        }
     }
 
     /**
@@ -303,10 +329,9 @@ public class LeafManager implements Listener {
      */
     public LeafType getLeafAt(World world, int x, int y, int z) {
         Chunk chunk = world.getChunkAt(x >> 4, z >> 4);
-        ChunkKey key = chunkKey(chunk);
-        Map<BlockPos, LeafType> map = leavesByChunk.get(key);
-        if (map == null) return null;
-        return map.get(new BlockPos(x, y, z));
+        Map<BlockKey, LeafEntry> map = getChunkMap(chunk);
+        LeafEntry entry = map.get(new BlockKey(x, y, z));
+        return entry == null ? null : entry.type();
     }
 
     /**
@@ -334,14 +359,7 @@ public class LeafManager implements Listener {
         }
 
         if (type != null) {
-            // Aseguramos persistent=true
-            if (data instanceof Leaves leaves) {
-                if (!leaves.isPersistent()) {
-                    leaves.setPersistent(true);
-                    block.setBlockData(leaves, false);
-                }
-            }
-            setLeafAt(world, x, y, z, type);
+            setLeafAt(block, type, false, false);
         }
 
         return type;
@@ -358,16 +376,7 @@ public class LeafManager implements Listener {
         Block block = event.getBlockPlaced();
         block.setType(hostMaterial, false);
 
-        BlockData data = block.getBlockData();
-        if (data instanceof Leaves leaves) {
-            leaves.setPersistent(true);
-            block.setBlockData(leaves, false);
-        }
-
         registerLeafAt(block, type);
-
-        Player p = event.getPlayer();
-        p.sendBlockChange(block.getLocation(), type.visualData());
     }
 
     @EventHandler(ignoreCancelled = true, priority = EventPriority.HIGHEST)
@@ -388,7 +397,6 @@ public class LeafManager implements Listener {
         Player player = event.getPlayer();
         ItemStack tool = player.getInventory().getItemInMainHand();
         boolean shears = (tool.getType() == Material.SHEARS);
-        boolean silk = tool.containsEnchantment(Enchantment.SILK_TOUCH);
 
         event.setDropItems(false);
 
@@ -400,8 +408,6 @@ public class LeafManager implements Listener {
             dropHandLoot(world, block.getLocation());
         }
 
-        // Bloque roto -> ya hay packet MULTI_BLOCK_CHANGE, el burst lo lanza LeavesPacketListener
-        // No hace falta lanzar otro aquí.
     }
 
     @EventHandler
@@ -409,65 +415,21 @@ public class LeafManager implements Listener {
         Chunk chunk = event.getChunk();
         ChunkKey key = chunkKey(chunk);
 
-        Map<BlockPos, LeafType> map = leavesByChunk.get(key);
-        if (map == null) {
-            map = new HashMap<>();
-            leavesByChunk.put(key, map);
-        }
+        Map<BlockKey, LeafEntry> map = loadChunkData(chunk);
+        leavesByChunk.put(key, map);
 
-        // 1) Cargar datos persistidos (hojas colocadas por jugadores / sesiones anteriores)
-        map.clear();
-        PersistentDataContainer pdc = chunk.getPersistentDataContainer();
-        String raw = pdc.get(chunkDataKey, PersistentDataType.STRING);
-
-        if (raw != null && !raw.isEmpty()) {
-            String[] parts = raw.split(";");
-            for (String part : parts) {
-                if (part.isEmpty()) continue;
-                String[] pv = part.split(":");
-                if (pv.length != 2) continue;
-
-                String[] coords = pv[0].split(",");
-                if (coords.length != 3) continue;
-
-                int x, y, z;
-                try {
-                    x = Integer.parseInt(coords[0]);
-                    y = Integer.parseInt(coords[1]);
-                    z = Integer.parseInt(coords[2]);
-                } catch (NumberFormatException ex) {
-                    continue;
-                }
-
-                String id = pv[1];
-                LeafType type = byId.get(id);
-                if (type == null) continue;
-
-                BlockPos pos = new BlockPos(x, y, z);
-                map.put(pos, type);
-            }
-        }
-
-        // 2) Escanear SIEMPRE el chunk del mundo para detectar hojas de Iris (azalea)
+        // Detectar hojas de Iris sin persistirlas
         scanChunkForHostLeaves(chunk, map);
-
-        // 3) Guardar el mapa completo (jugadores + Iris)
-        saveChunkData(chunk, map);
     }
 
     @EventHandler
     public void onChunkUnload(ChunkUnloadEvent event) {
-        // Opcional limpiar leavesByChunk, pero no es obligatorio.
+        leavesByChunk.remove(chunkKey(event.getChunk()));
     }
 
     @EventHandler
     public void onPlayerJoin(PlayerJoinEvent event) {
-        Player player = event.getPlayer();
-        // Nada más entrar, burst de repintado para evitar ver azaleas durante la carga inicial
-        Bukkit.getScheduler().runTaskLater(plugin, () -> {
-            if (!player.isOnline()) return;
-            startVisualBurst(player, 20, 16);
-        }, 20L);
+        // Nada que hacer: los bloques ya están en el estado correcto y no necesitan "reskins".
     }
 
     // ==================== ESCANEO DE CHUNK (IRIS) ====================
@@ -476,7 +438,7 @@ public class LeafManager implements Listener {
      * Escanea un chunk para encontrar AZALEA_LEAVES de Iris y registrarlas si
      * aún no están en el mapa (no pisa hojas ya registradas por jugadores).
      */
-    private void scanChunkForHostLeaves(Chunk chunk, Map<BlockPos, LeafType> map) {
+    private void scanChunkForHostLeaves(Chunk chunk, Map<BlockKey, LeafEntry> map) {
         World world = chunk.getWorld();
 
         int minY = world.getMinHeight();
@@ -494,7 +456,7 @@ public class LeafManager implements Listener {
                     Block block = world.getBlockAt(x, y, z);
                     if (block.getType() != hostMaterial) continue;
 
-                    BlockPos pos = new BlockPos(x, y, z);
+                    BlockKey pos = new BlockKey(x, y, z);
                     if (map.containsKey(pos)) {
                         // Ya hay una hoja registrada aquí (probablemente de jugador)
                         continue;
@@ -505,10 +467,6 @@ public class LeafManager implements Listener {
 
                     if (data instanceof Leaves leaves) {
                         type = byDistance.get(leaves.getDistance());
-                        if (!leaves.isPersistent()) {
-                            leaves.setPersistent(true);
-                            block.setBlockData(leaves, false);
-                        }
                     }
 
                     if (type == null && !byId.isEmpty()) {
@@ -516,7 +474,8 @@ public class LeafManager implements Listener {
                     }
 
                     if (type != null) {
-                        map.put(pos, type);
+                        map.put(pos, new LeafEntry(type, false));
+                        applyLeafState(block, type);
                     }
                 }
             }
@@ -542,87 +501,129 @@ public class LeafManager implements Listener {
         }
     }
 
-    // ==================== VISUALES ====================
+    
 
-    /**
-     * HARDCORE:
-     * Escanea TODOS los bloques en un radio alrededor del jugador,
-     * y cualquier AZALEA_LEAVES se fuerza a su textura custom correspondiente.
-     *
-     * - Usa getOrDetectLeafAt => si no estaba registrada, la detecta por distance o le asigna una.
-     */
-    public void sendAllVisualsAround(Player player, int radius) {
-        World world = player.getWorld();
-        org.bukkit.Location base = player.getLocation();
 
-        int cx = base.getBlockX();
-        int cy = base.getBlockY();
-        int cz = base.getBlockZ();
+    private void applyLeafState(Block block, LeafType type) {
+        if (type == null) return;
 
-        int r = radius;
-        int rSq = r * r;
+        if (block.getType() != hostMaterial) {
+            block.setType(hostMaterial, false);
+        }
 
-        int yRadius = Math.min(r, 16);
-        int minY = Math.max(world.getMinHeight(), cy - yRadius);
-        int maxY = Math.min(world.getMaxHeight() - 1, cy + yRadius);
+        BlockData data = block.getBlockData();
+        if (!(data instanceof Leaves leaves)) return;
 
-        for (int x = cx - r; x <= cx + r; x++) {
-            for (int z = cz - r; z <= cz + r; z++) {
-                int dx = x - cx;
-                int dz = z - cz;
-                if (dx * dx + dz * dz > rSq) continue;
+        boolean changed = false;
 
-                for (int y = minY; y <= maxY; y++) {
-                    Block block = world.getBlockAt(x, y, z);
-                    if (block.getType() != hostMaterial) continue;
+        if (leaves.getDistance() != type.distanceId()) {
+            leaves.setDistance(type.distanceId());
+            changed = true;
+        }
+        if (!leaves.isPersistent()) {
+            leaves.setPersistent(true);
+            changed = true;
+        }
+        if (leaves.isWaterlogged()) {
+            leaves.setWaterlogged(false);
+            changed = true;
+        }
 
-                    LeafType type = getOrDetectLeafAt(world, x, y, z);
-                    if (type == null) continue;
-
-                    player.sendBlockChange(block.getLocation(), type.visualData());
-                }
-            }
+        if (changed) {
+            block.setBlockData(leaves, false);
         }
     }
 
-    /**
-     * Inicia un "burst" visual para un jugador:
-     * durante 'ticks' repite sendAllVisualsAround cada tick para evitar que
-     * los recalculos de distance de Mojang dejen las hojas como azalea.
-     */
-    public void startVisualBurst(Player player, int ticks, int radius) {
-        if (ticks <= 0) return;
-        UUID uuid = player.getUniqueId();
+    @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+    public void onLeafPhysics(BlockPhysicsEvent event) {
+        Block block = event.getBlock();
+        if (block.getType() != hostMaterial) return;
 
-        // Cancelar burst anterior si existe
-        Integer oldTask = visualBurstTasks.remove(uuid);
-        if (oldTask != null) {
-            Bukkit.getScheduler().cancelTask(oldTask);
-        }
+        LeafType type = getOrDetectLeafAt(block.getWorld(), block.getX(), block.getY(), block.getZ());
+        if (type == null) return;
 
-        int[] holder = new int[1];
-        holder[0] = Bukkit.getScheduler().scheduleSyncRepeatingTask(plugin, new Runnable() {
-            int remaining = ticks;
-
-            @Override
-            public void run() {
-                if (!player.isOnline() || remaining-- <= 0) {
-                    Bukkit.getScheduler().cancelTask(holder[0]);
-                    visualBurstTasks.remove(uuid);
-                    return;
-                }
-                sendAllVisualsAround(player, radius);
-            }
-        }, 0L, 1L); // delay 0L para repintar lo antes posible
-
-        visualBurstTasks.put(uuid, holder[0]);
+        applyLeafState(block, type);
+        event.setCancelled(true);
     }
 
     private void rebuildLoadedChunks() {
         for (World world : Bukkit.getWorlds()) {
             for (Chunk chunk : world.getLoadedChunks()) {
+                leavesByChunk.remove(chunkKey(chunk));
                 ChunkLoadEvent fake = new ChunkLoadEvent(chunk, false);
                 onChunkLoad(fake);
+            }
+        }
+    }
+
+    private Map<BlockKey, LeafEntry> loadChunkData(Chunk chunk) {
+        Map<BlockKey, LeafEntry> map = new HashMap<>();
+        PersistentDataContainer pdc = chunk.getPersistentDataContainer();
+        String raw = pdc.get(chunkDataKey, PersistentDataType.STRING);
+
+        int skipped = 0;
+
+        if (raw != null && !raw.isEmpty()) {
+            String[] parts = raw.split(";");
+            for (String part : parts) {
+                if (part.isEmpty()) continue;
+                String[] pv = part.split(":");
+                if (pv.length != 2) continue;
+
+                String[] coords = pv[0].split(",");
+                if (coords.length != 3) continue;
+
+                int x, y, z;
+                try {
+                    x = Integer.parseInt(coords[0]);
+                    y = Integer.parseInt(coords[1]);
+                    z = Integer.parseInt(coords[2]);
+                } catch (NumberFormatException ex) {
+                    continue;
+                }
+
+                String id = pv[1];
+                LeafType type = byId.get(id);
+                if (type == null) continue;
+
+                BlockKey pos = new BlockKey(x, y, z);
+                if ((pos.x() >> 4) != chunk.getX() || (pos.z() >> 4) != chunk.getZ()) {
+                    skipped++;
+                    continue;
+                }
+
+                map.put(pos, new LeafEntry(type, true));
+                applyLeafState(chunk.getWorld().getBlockAt(pos.x(), pos.y(), pos.z()), type);
+            }
+        }
+
+        if (skipped > 0) {
+            plugin.getLogger().warning("Ignoradas " + skipped + " hojas persistidas fuera del chunk " + chunk.getX() + "," + chunk.getZ());
+        }
+
+        return map;
+    }
+
+    /**
+     * Fallback manual refresher usado por comandos o depuración externa.
+     * Reaplica el estado custom a todas las hojas rastreadas en chunks cargados.
+     */
+    public void processReskinQueue() {
+        for (Map.Entry<ChunkKey, Map<BlockKey, LeafEntry>> entry : leavesByChunk.entrySet()) {
+            ChunkKey chunkKey = entry.getKey();
+            World world = Bukkit.getWorld(chunkKey.worldId());
+            if (world == null) continue;
+
+            if (!world.isChunkLoaded(chunkKey.x(), chunkKey.z())) {
+                continue;
+            }
+
+            Chunk chunk = world.getChunkAt(chunkKey.x(), chunkKey.z());
+            Map<BlockKey, LeafEntry> blocks = entry.getValue();
+            for (Map.Entry<BlockKey, LeafEntry> blockEntry : blocks.entrySet()) {
+                BlockKey pos = blockEntry.getKey();
+                LeafEntry leafEntry = blockEntry.getValue();
+                applyLeafState(world.getBlockAt(pos.x(), pos.y(), pos.z()), leafEntry.type());
             }
         }
     }
