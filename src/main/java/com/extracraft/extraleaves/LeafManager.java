@@ -57,11 +57,8 @@ public class LeafManager implements Listener {
     private final Map<String, LeafType> byId = new HashMap<>();
     private final Map<Integer, LeafType> byDistance = new HashMap<>();
 
-    // ChunkKey -> (BlockPos -> LeafEntry)
-    private final Map<ChunkKey, Map<BlockPos, LeafEntry>> leavesByChunk = new HashMap<>();
-
-    // Cola de posiciones que necesitan repintado repetido durante unos ticks
-    private final Map<BlockKey, Integer> reskinQueue = new HashMap<>();
+    // ChunkKey -> (BlockKey -> LeafEntry)
+    private final Map<ChunkKey, Map<BlockKey, LeafEntry>> leavesByChunk = new HashMap<>();
 
     // Drops al romper con la mano
     private static class HandDrop {
@@ -82,7 +79,7 @@ public class LeafManager implements Listener {
 
     // Claves auxiliares para map
     private record ChunkKey(UUID worldId, int x, int z) {}
-    private record BlockPos(int x, int y, int z) {}
+    private record BlockKey(int x, int y, int z) {}
     private record LeafEntry(LeafType type, boolean persistent) {}
 
     public LeafManager(ExtraLeavesPlugin plugin) {
@@ -256,27 +253,27 @@ public class LeafManager implements Listener {
         return new ChunkKey(chunk.getWorld().getUID(), chunk.getX(), chunk.getZ());
     }
 
-    private BlockPos blockPos(Block block) {
-        return new BlockPos(block.getX(), block.getY(), block.getZ());
+    private BlockKey blockPos(Block block) {
+        return new BlockKey(block.getX(), block.getY(), block.getZ());
     }
 
 
-    private Map<BlockPos, LeafEntry> getChunkMap(Chunk chunk) {
+    private Map<BlockKey, LeafEntry> getChunkMap(Chunk chunk) {
         ChunkKey key = chunkKey(chunk);
-        Map<BlockPos, LeafEntry> existing = leavesByChunk.get(key);
+        Map<BlockKey, LeafEntry> existing = leavesByChunk.get(key);
         if (existing != null) {
             return existing;
         }
 
-        Map<BlockPos, LeafEntry> loaded = loadChunkData(chunk);
+        Map<BlockKey, LeafEntry> loaded = loadChunkData(chunk);
         leavesByChunk.put(key, loaded);
         return loaded;
     }
 
     private void setLeafAt(Block block, LeafType type, boolean persistent, boolean savePersistentChanges) {
         Chunk chunk = block.getChunk();
-        Map<BlockPos, LeafEntry> map = getChunkMap(chunk);
-        BlockPos pos = blockPos(block);
+        Map<BlockKey, LeafEntry> map = getChunkMap(chunk);
+        BlockKey pos = blockPos(block);
 
         LeafEntry previous = map.put(pos, new LeafEntry(type, persistent));
         applyLeafState(block, type);
@@ -297,7 +294,7 @@ public class LeafManager implements Listener {
 
     private void unregisterLeafAt(Block block) {
         Chunk chunk = block.getChunk();
-        Map<BlockPos, LeafEntry> map = leavesByChunk.get(chunkKey(chunk));
+        Map<BlockKey, LeafEntry> map = leavesByChunk.get(chunkKey(chunk));
         if (map == null) return;
 
         LeafEntry removed = map.remove(blockPos(block));
@@ -306,7 +303,7 @@ public class LeafManager implements Listener {
         }
     }
 
-    private void saveChunkData(Chunk chunk, Map<BlockPos, LeafEntry> map) {
+    private void saveChunkData(Chunk chunk, Map<BlockKey, LeafEntry> map) {
         PersistentDataContainer pdc = chunk.getPersistentDataContainer();
 
         if (map == null) {
@@ -315,11 +312,11 @@ public class LeafManager implements Listener {
         }
 
         StringBuilder sb = new StringBuilder();
-        for (Map.Entry<BlockPos, LeafEntry> e : map.entrySet()) {
+        for (Map.Entry<BlockKey, LeafEntry> e : map.entrySet()) {
             LeafEntry entry = e.getValue();
             if (!entry.persistent()) continue;
 
-            BlockPos pos = e.getKey();
+            BlockKey pos = e.getKey();
             sb.append(pos.x()).append(",")
                     .append(pos.y()).append(",")
                     .append(pos.z()).append(":")
@@ -338,8 +335,8 @@ public class LeafManager implements Listener {
      */
     public LeafType getLeafAt(World world, int x, int y, int z) {
         Chunk chunk = world.getChunkAt(x >> 4, z >> 4);
-        Map<BlockPos, LeafEntry> map = getChunkMap(chunk);
-        LeafEntry entry = map.get(new BlockPos(x, y, z));
+        Map<BlockKey, LeafEntry> map = getChunkMap(chunk);
+        LeafEntry entry = map.get(new BlockKey(x, y, z));
         return entry == null ? null : entry.type();
     }
 
@@ -424,7 +421,7 @@ public class LeafManager implements Listener {
         Chunk chunk = event.getChunk();
         ChunkKey key = chunkKey(chunk);
 
-        Map<BlockPos, LeafEntry> map = loadChunkData(chunk);
+        Map<BlockKey, LeafEntry> map = loadChunkData(chunk);
         leavesByChunk.put(key, map);
 
         // Detectar hojas de Iris sin persistirlas
@@ -447,7 +444,7 @@ public class LeafManager implements Listener {
      * Escanea un chunk para encontrar AZALEA_LEAVES de Iris y registrarlas si
      * aún no están en el mapa (no pisa hojas ya registradas por jugadores).
      */
-    private void scanChunkForHostLeaves(Chunk chunk, Map<BlockPos, LeafEntry> map) {
+    private void scanChunkForHostLeaves(Chunk chunk, Map<BlockKey, LeafEntry> map) {
         World world = chunk.getWorld();
 
         int minY = world.getMinHeight();
@@ -465,7 +462,7 @@ public class LeafManager implements Listener {
                     Block block = world.getBlockAt(x, y, z);
                     if (block.getType() != hostMaterial) continue;
 
-                    BlockPos pos = new BlockPos(x, y, z);
+                    BlockKey pos = new BlockKey(x, y, z);
                     if (map.containsKey(pos)) {
                         // Ya hay una hoja registrada aquí (probablemente de jugador)
                         continue;
@@ -565,8 +562,8 @@ public class LeafManager implements Listener {
         }
     }
 
-    private Map<BlockPos, LeafEntry> loadChunkData(Chunk chunk) {
-        Map<BlockPos, LeafEntry> map = new HashMap<>();
+    private Map<BlockKey, LeafEntry> loadChunkData(Chunk chunk) {
+        Map<BlockKey, LeafEntry> map = new HashMap<>();
         PersistentDataContainer pdc = chunk.getPersistentDataContainer();
         String raw = pdc.get(chunkDataKey, PersistentDataType.STRING);
 
@@ -593,12 +590,36 @@ public class LeafManager implements Listener {
                 LeafType type = byId.get(id);
                 if (type == null) continue;
 
-                BlockPos pos = new BlockPos(x, y, z);
+                BlockKey pos = new BlockKey(x, y, z);
                 map.put(pos, new LeafEntry(type, true));
                 applyLeafState(chunk.getBlock(pos.x(), pos.y(), pos.z()), type);
             }
         }
 
         return map;
+    }
+
+    /**
+     * Fallback manual refresher usado por comandos o depuración externa.
+     * Reaplica el estado custom a todas las hojas rastreadas en chunks cargados.
+     */
+    public void processReskinQueue() {
+        for (Map.Entry<ChunkKey, Map<BlockKey, LeafEntry>> entry : leavesByChunk.entrySet()) {
+            ChunkKey chunkKey = entry.getKey();
+            World world = Bukkit.getWorld(chunkKey.worldId());
+            if (world == null) continue;
+
+            if (!world.isChunkLoaded(chunkKey.x(), chunkKey.z())) {
+                continue;
+            }
+
+            Chunk chunk = world.getChunkAt(chunkKey.x(), chunkKey.z());
+            Map<BlockKey, LeafEntry> blocks = entry.getValue();
+            for (Map.Entry<BlockKey, LeafEntry> blockEntry : blocks.entrySet()) {
+                BlockKey pos = blockEntry.getKey();
+                LeafEntry leafEntry = blockEntry.getValue();
+                applyLeafState(chunk.getBlock(pos.x(), pos.y(), pos.z()), leafEntry.type());
+            }
+        }
     }
 }
