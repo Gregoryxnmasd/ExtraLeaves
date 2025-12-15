@@ -43,6 +43,9 @@ public class LeafManager implements Listener {
 
     private final ExtraLeavesPlugin plugin;
 
+    private static final int RESKIN_VIEW_RADIUS = 32;
+    private static final int MAX_RESENDS_PER_TICK = 800;
+
     // Bloque host real (Iris + plugin usan AZALEA_LEAVES)
     private final Material hostMaterial = Material.AZALEA_LEAVES;
 
@@ -56,6 +59,9 @@ public class LeafManager implements Listener {
 
     // ChunkKey -> (BlockPos -> LeafType)
     private final Map<ChunkKey, Map<BlockPos, LeafType>> leavesByChunk = new HashMap<>();
+
+    // Cola de posiciones que necesitan repintado repetido durante unos ticks
+    private final Map<BlockKey, Integer> reskinQueue = new HashMap<>();
 
     // Drops al romper con la mano
     private static class HandDrop {
@@ -77,6 +83,7 @@ public class LeafManager implements Listener {
     // Claves auxiliares para map
     private record ChunkKey(UUID worldId, int x, int z) {}
     private record BlockPos(int x, int y, int z) {}
+    private record BlockKey(UUID worldId, int x, int y, int z) {}
 
     public LeafManager(ExtraLeavesPlugin plugin) {
         this.plugin = plugin;
@@ -90,6 +97,9 @@ public class LeafManager implements Listener {
 
         // Reconstruir datos persistidos (hojas colocadas antes del restart)
         Bukkit.getScheduler().runTask(plugin, this::rebuildLoadedChunks);
+
+        // Reloj ligero para procesar la cola de repintados sin burst masivos
+        Bukkit.getScheduler().runTaskTimer(plugin, this::processReskinQueue, 1L, 1L);
     }
 
     // ==================== CONFIG ====================
@@ -558,6 +568,114 @@ public class LeafManager implements Listener {
 
         applyLeafState(block, type);
         event.setCancelled(true);
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onLeafPhysics(BlockPhysicsEvent event) {
+        Block block = event.getBlock();
+        if (block.getType() != hostMaterial) return;
+
+        LeafType type = getOrDetectLeafAt(block.getWorld(), block.getX(), block.getY(), block.getZ());
+        if (type == null) return;
+
+        queueReskin(block, 16);
+        sendVisual(block, type, getNearbyViewers(block.getLocation(), RESKIN_VIEW_RADIUS));
+    }
+
+    private List<Player> getNearbyViewers(org.bukkit.Location center, int radius) {
+        World world = center.getWorld();
+        if (world == null) return Collections.emptyList();
+
+        int rSq = radius * radius;
+        List<Player> viewers = new ArrayList<>();
+        for (Player player : world.getPlayers()) {
+            if (!player.isOnline()) continue;
+            double dx = player.getLocation().getX() - center.getX();
+            double dz = player.getLocation().getZ() - center.getZ();
+            if (dx * dx + dz * dz <= rSq) {
+                viewers.add(player);
+            }
+        }
+        return viewers;
+    }
+
+    private void sendVisual(Block block, LeafType type, Collection<Player> viewers) {
+        if (viewers == null || viewers.isEmpty()) return;
+        org.bukkit.Location loc = block.getLocation();
+        for (Player viewer : viewers) {
+            if (viewer.isOnline()) {
+                viewer.sendBlockChange(loc, type.visualData());
+            }
+        }
+    }
+
+    private void processReskinQueue() {
+        if (reskinQueue.isEmpty()) return;
+
+        int processed = 0;
+        Map<ChunkKey, Map<BlockPos, LeafType>> perChunk = new HashMap<>();
+
+        Iterator<Map.Entry<BlockKey, Integer>> it = reskinQueue.entrySet().iterator();
+        while (it.hasNext() && processed < MAX_RESENDS_PER_TICK) {
+            Map.Entry<BlockKey, Integer> entry = it.next();
+            BlockKey key = entry.getKey();
+            World world = Bukkit.getWorld(key.worldId());
+            if (world == null) {
+                it.remove();
+                continue;
+            }
+
+            Block block = world.getBlockAt(key.x(), key.y(), key.z());
+            if (block.getType() != hostMaterial) {
+                it.remove();
+                continue;
+            }
+
+            LeafType type = getOrDetectLeafAt(world, key.x(), key.y(), key.z());
+            if (type == null) {
+                it.remove();
+                continue;
+            }
+
+            ChunkKey chunkKey = new ChunkKey(world.getUID(), key.x() >> 4, key.z() >> 4);
+            perChunk.computeIfAbsent(chunkKey, k -> new HashMap<>())
+                    .put(new BlockPos(key.x(), key.y(), key.z()), type);
+
+            int remaining = entry.getValue() - 1; // reloj cada tick
+            if (remaining <= 0) {
+                it.remove();
+            } else {
+                entry.setValue(remaining);
+            }
+
+            processed++;
+        }
+
+        if (perChunk.isEmpty()) return;
+
+        for (Map.Entry<ChunkKey, Map<BlockPos, LeafType>> entry : perChunk.entrySet()) {
+            ChunkKey key = entry.getKey();
+            World world = Bukkit.getWorld(key.worldId());
+            if (world == null) continue;
+
+            Map<org.bukkit.Location, BlockData> payload = new HashMap<>();
+            for (Map.Entry<BlockPos, LeafType> e : entry.getValue().entrySet()) {
+                BlockPos pos = e.getKey();
+                org.bukkit.Location loc = new org.bukkit.Location(world, pos.x(), pos.y(), pos.z());
+                payload.put(loc, e.getValue().visualData());
+            }
+
+            if (payload.isEmpty()) continue;
+
+            org.bukkit.Location center = new org.bukkit.Location(world, (key.x << 4) + 8, 64, (key.z << 4) + 8);
+            Collection<Player> viewers = getNearbyViewers(center, RESKIN_VIEW_RADIUS);
+            if (viewers.isEmpty()) continue;
+
+            for (Player viewer : viewers) {
+                if (!viewer.isOnline()) continue;
+                viewer.sendMultiBlockChange(payload);
+            }
+        }
     }
 
     private void rebuildLoadedChunks() {
