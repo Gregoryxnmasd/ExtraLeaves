@@ -567,6 +567,8 @@ public class LeafManager implements Listener {
         PersistentDataContainer pdc = chunk.getPersistentDataContainer();
         String raw = pdc.get(chunkDataKey, PersistentDataType.STRING);
 
+        int skipped = 0;
+
         if (raw != null && !raw.isEmpty()) {
             String[] parts = raw.split(";");
             for (String part : parts) {
@@ -591,9 +593,18 @@ public class LeafManager implements Listener {
                 if (type == null) continue;
 
                 BlockKey pos = new BlockKey(x, y, z);
+                if ((pos.x() >> 4) != chunk.getX() || (pos.z() >> 4) != chunk.getZ()) {
+                    skipped++;
+                    continue;
+                }
+
                 map.put(pos, new LeafEntry(type, true));
-                applyLeafState(chunk.getBlock(pos.x(), pos.y(), pos.z()), type);
+                applyLeafState(chunk.getWorld().getBlockAt(pos.x(), pos.y(), pos.z()), type);
             }
+        }
+
+        if (skipped > 0) {
+            plugin.getLogger().warning("Ignoradas " + skipped + " hojas persistidas fuera del chunk " + chunk.getX() + "," + chunk.getZ());
         }
 
         return map;
@@ -618,7 +629,7 @@ public class LeafManager implements Listener {
             for (Map.Entry<BlockKey, LeafEntry> blockEntry : blocks.entrySet()) {
                 BlockKey pos = blockEntry.getKey();
                 LeafEntry leafEntry = blockEntry.getValue();
-                applyLeafState(chunk.getBlock(pos.x(), pos.y(), pos.z()), leafEntry.type());
+                applyLeafState(world.getBlockAt(pos.x(), pos.y(), pos.z()), leafEntry.type());
             }
         }
     }
