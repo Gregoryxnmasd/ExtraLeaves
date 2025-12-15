@@ -84,6 +84,16 @@ public class LeafManager implements Listener {
     // Tareas de bursts visuales por jugador
     private final Map<UUID, Integer> visualBurstTasks = new HashMap<>();
 
+    // Bursts de estabilidad local tras roturas (para evitar flickering prolongado)
+    private static class StabilityBurst {
+        int taskId;
+        int remaining;
+    }
+
+    private record StabilityKey(UUID worldId, int x, int y, int z, int radius) {}
+
+    private final Map<StabilityKey, StabilityBurst> stabilityBursts = new HashMap<>();
+
     // Claves auxiliares para map
     private record ChunkKey(UUID worldId, int x, int z) {}
     private record BlockPos(int x, int y, int z) {}
