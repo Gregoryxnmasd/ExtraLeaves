@@ -3,6 +3,7 @@ package com.extracraft.extraleaves;
 import org.bukkit.Bukkit;
 import org.bukkit.ChatColor;
 import org.bukkit.Chunk;
+import org.bukkit.Location;
 import org.bukkit.Material;
 import org.bukkit.NamespacedKey;
 import org.bukkit.World;
@@ -76,6 +77,16 @@ public class LeafManager implements Listener {
 
     // Tareas de bursts visuales por jugador
     private final Map<UUID, Integer> visualBurstTasks = new HashMap<>();
+
+    // Bursts de estabilidad local tras roturas (para evitar flickering prolongado)
+    private static class StabilityBurst {
+        int taskId;
+        int remaining;
+    }
+
+    private record StabilityKey(UUID worldId, int x, int y, int z, int radius) {}
+
+    private final Map<StabilityKey, StabilityBurst> stabilityBursts = new HashMap<>();
 
     // Claves auxiliares para map
     private record ChunkKey(UUID worldId, int x, int z) {}
@@ -401,14 +412,13 @@ public class LeafManager implements Listener {
             dropHandLoot(world, block.getLocation());
         }
 
-        // Refuerzo visual: en mundos generados por Iris (u otros sistemas) algunas
-        // hojas no provocan packets de block change cuando se rompen (o PacketEvents
-        // podría no capturarlos). Para evitar flickering entre azalea y la textura
-        // custom, repintamos de forma inmediata y luego un par de ticks después,
-        // sin usar bursts continuos.
+        // Refuerzo visual: la distancia de las azaleas se recalcula en cadena durante ~1s,
+        // lo que enviaba múltiples block-changes vanilla y provocaba flickering. En vez de
+        // bursts globales, abrimos una ventana corta de estabilidad local para repintar con
+        // la textura custom mientras duren los recalculos.
         org.bukkit.Location center = block.getLocation();
         repaintHostLeavesAround(center, 16);
-        Bukkit.getScheduler().runTaskLater(plugin, () -> repaintHostLeavesAround(center, 16), 2L);
+        startStabilityBurst(center, 16, 20, 2); // 1s de estabilización, cada 2 ticks
     }
 
     @EventHandler
@@ -562,6 +572,40 @@ public class LeafManager implements Listener {
         repaintHostLeavesAround(player.getLocation(), radius, player);
     }
 
+    /**
+     * Tras una rotura forzada por Iris, Mojang recalcula distances durante varios ticks
+     * y puede mandar múltiples block-changes vanilla. Este estabilizador reaplica la
+     * textura custom cada "intervalTicks" mientras dure la ventana de "durationTicks".
+     */
+    private void startStabilityBurst(Location center, int radius, int durationTicks, int intervalTicks) {
+        World world = center.getWorld();
+        if (world == null || durationTicks <= 0 || intervalTicks <= 0) return;
+
+        StabilityKey key = new StabilityKey(world.getUID(), center.getBlockX(), center.getBlockY(), center.getBlockZ(), radius);
+        StabilityBurst existing = stabilityBursts.get(key);
+        if (existing != null) {
+            existing.remaining = Math.max(existing.remaining, durationTicks);
+            return;
+        }
+
+        Location origin = center.clone();
+        StabilityBurst burst = new StabilityBurst();
+        burst.remaining = durationTicks;
+
+        burst.taskId = Bukkit.getScheduler().scheduleSyncRepeatingTask(plugin, () -> {
+            if (burst.remaining <= 0) {
+                Bukkit.getScheduler().cancelTask(burst.taskId);
+                stabilityBursts.remove(key);
+                return;
+            }
+
+            burst.remaining -= intervalTicks;
+            repaintHostLeavesAround(origin, radius);
+        }, 0L, intervalTicks);
+
+        stabilityBursts.put(key, burst);
+    }
+
     private void repaintHostLeavesAround(org.bukkit.Location center, int radius) {
         repaintHostLeavesAround(center, radius, null);
     }
@@ -658,6 +702,7 @@ public class LeafManager implements Listener {
         if (type == null) return;
 
         sendVisual(block, type, getNearbyViewers(block.getLocation(), 32));
+        startStabilityBurst(block.getLocation(), 12, 10, 2);
     }
 
     private List<Player> getNearbyViewers(org.bukkit.Location center, int radius) {
