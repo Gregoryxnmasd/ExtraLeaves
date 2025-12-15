@@ -12,7 +12,6 @@ import org.bukkit.block.data.BlockData;
 import org.bukkit.block.data.type.Leaves;
 import org.bukkit.configuration.ConfigurationSection;
 import org.bukkit.configuration.file.FileConfiguration;
-import org.bukkit.enchantments.Enchantment;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
@@ -38,7 +37,7 @@ import java.util.concurrent.ThreadLocalRandom;
  *  - registro de posiciones de hojas custom por chunk (para drops, memoria, etc.)
  *  - integración con Iris (escanear chunks)
  *  - drops al romper
- *  - repintado visual (sendAllVisualsAround + bursts hardcodeados)
+ *  - estabilidad visual (bloqueo de physics + estado persistente)
  */
 public class LeafManager implements Listener {
 
@@ -80,19 +79,6 @@ public class LeafManager implements Listener {
     }
 
     private final List<HandDrop> handDrops = new ArrayList<>();
-
-    // Tareas de bursts visuales por jugador
-    private final Map<UUID, Integer> visualBurstTasks = new HashMap<>();
-
-    // Bursts de estabilidad local tras roturas (para evitar flickering prolongado)
-    private static class StabilityBurst {
-        int taskId;
-        int remaining;
-    }
-
-    private record StabilityKey(UUID worldId, int x, int y, int z, int radius) {}
-
-    private final Map<StabilityKey, StabilityBurst> stabilityBursts = new HashMap<>();
 
     // Claves auxiliares para map
     private record ChunkKey(UUID worldId, int x, int z) {}
@@ -283,6 +269,7 @@ public class LeafManager implements Listener {
         ChunkKey key = chunkKey(chunk);
         Map<BlockPos, LeafType> map = getOrCreateChunkMap(key);
         map.put(new BlockPos(x, y, z), type);
+        applyLeafState(world.getBlockAt(x, y, z), type);
         saveChunkData(chunk, map);
     }
 
@@ -356,13 +343,7 @@ public class LeafManager implements Listener {
         }
 
         if (type != null) {
-            // Aseguramos persistent=true
-            if (data instanceof Leaves leaves) {
-                if (!leaves.isPersistent()) {
-                    leaves.setPersistent(true);
-                    block.setBlockData(leaves, false);
-                }
-            }
+            applyLeafState(block, type);
             setLeafAt(world, x, y, z, type);
         }
 
@@ -380,16 +361,7 @@ public class LeafManager implements Listener {
         Block block = event.getBlockPlaced();
         block.setType(hostMaterial, false);
 
-        BlockData data = block.getBlockData();
-        if (data instanceof Leaves leaves) {
-            leaves.setPersistent(true);
-            block.setBlockData(leaves, false);
-        }
-
         registerLeafAt(block, type);
-
-        Player p = event.getPlayer();
-        p.sendBlockChange(block.getLocation(), type.visualData());
     }
 
     @EventHandler(ignoreCancelled = true, priority = EventPriority.HIGHEST)
@@ -410,7 +382,6 @@ public class LeafManager implements Listener {
         Player player = event.getPlayer();
         ItemStack tool = player.getInventory().getItemInMainHand();
         boolean shears = (tool.getType() == Material.SHEARS);
-        boolean silk = tool.containsEnchantment(Enchantment.SILK_TOUCH);
 
         event.setDropItems(false);
 
@@ -422,11 +393,6 @@ public class LeafManager implements Listener {
             dropHandLoot(world, block.getLocation());
         }
 
-        // Estabilización optimizada: repintamos solo las hojas registradas cercanas y
-        // las mantenemos en la cola durante unos ticks para cubrir los recalculos de distance.
-        org.bukkit.Location center = block.getLocation();
-        repaintHostLeavesAround(center, 14, null);
-        queueRegisteredLeavesAround(center, 14, 28);
     }
 
     @EventHandler
@@ -487,12 +453,7 @@ public class LeafManager implements Listener {
 
     @EventHandler
     public void onPlayerJoin(PlayerJoinEvent event) {
-        Player player = event.getPlayer();
-        // Nada más entrar, burst de repintado para evitar ver azaleas durante la carga inicial
-        Bukkit.getScheduler().runTaskLater(plugin, () -> {
-            if (!player.isOnline()) return;
-            startVisualBurst(player, 20, 16);
-        }, 20L);
+        // Nada que hacer: los bloques ya están en el estado correcto y no necesitan "reskins".
     }
 
     // ==================== ESCANEO DE CHUNK (IRIS) ====================
@@ -530,10 +491,6 @@ public class LeafManager implements Listener {
 
                     if (data instanceof Leaves leaves) {
                         type = byDistance.get(leaves.getDistance());
-                        if (!leaves.isPersistent()) {
-                            leaves.setPersistent(true);
-                            block.setBlockData(leaves, false);
-                        }
                     }
 
                     if (type == null && !byId.isEmpty()) {
@@ -542,6 +499,7 @@ public class LeafManager implements Listener {
 
                     if (type != null) {
                         map.put(pos, type);
+                        applyLeafState(block, type);
                     }
                 }
             }
@@ -567,157 +525,49 @@ public class LeafManager implements Listener {
         }
     }
 
-    private void queueReskin(Block block, int durationTicks) {
-        queueReskin(block.getWorld(), block.getX(), block.getY(), block.getZ(), durationTicks);
-    }
+    
 
-    private void queueReskin(World world, int x, int y, int z, int durationTicks) {
-        if (durationTicks <= 0 || world == null) return;
-        BlockKey key = new BlockKey(world.getUID(), x, y, z);
-        reskinQueue.merge(key, durationTicks, Math::max);
-    }
 
-    private void queueRegisteredLeavesAround(org.bukkit.Location center, int radius, int durationTicks) {
-        World world = center.getWorld();
-        if (world == null || radius <= 0 || durationTicks <= 0) return;
+    private void applyLeafState(Block block, LeafType type) {
+        if (type == null) return;
 
-        int cx = center.getBlockX();
-        int cy = center.getBlockY();
-        int cz = center.getBlockZ();
+        if (block.getType() != hostMaterial) {
+            block.setType(hostMaterial, false);
+        }
 
-        int r = radius;
-        int rSq = r * r;
-        int minY = Math.max(world.getMinHeight(), cy - r);
-        int maxY = Math.min(world.getMaxHeight() - 1, cy + r);
+        BlockData data = block.getBlockData();
+        if (!(data instanceof Leaves leaves)) return;
 
-        int minChunkX = (cx - r) >> 4;
-        int maxChunkX = (cx + r) >> 4;
-        int minChunkZ = (cz - r) >> 4;
-        int maxChunkZ = (cz + r) >> 4;
+        boolean changed = false;
 
-        for (int chunkX = minChunkX; chunkX <= maxChunkX; chunkX++) {
-            for (int chunkZ = minChunkZ; chunkZ <= maxChunkZ; chunkZ++) {
-                Map<BlockPos, LeafType> chunkMap = leavesByChunk.get(new ChunkKey(world.getUID(), chunkX, chunkZ));
-                if (chunkMap == null || chunkMap.isEmpty()) continue;
+        if (leaves.getDistance() != type.distanceId()) {
+            leaves.setDistance(type.distanceId());
+            changed = true;
+        }
+        if (!leaves.isPersistent()) {
+            leaves.setPersistent(true);
+            changed = true;
+        }
+        if (leaves.isWaterlogged()) {
+            leaves.setWaterlogged(false);
+            changed = true;
+        }
 
-                for (BlockPos pos : chunkMap.keySet()) {
-                    int dx = pos.x() - cx;
-                    int dz = pos.z() - cz;
-                    if (dx * dx + dz * dz > rSq) continue;
-                    if (pos.y() < minY || pos.y() > maxY) continue;
-
-                    queueReskin(world, pos.x(), pos.y(), pos.z(), durationTicks);
-                }
-            }
+        if (changed) {
+            block.setBlockData(leaves, false);
         }
     }
 
-    // ==================== VISUALES ====================
+    @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+    public void onLeafPhysics(BlockPhysicsEvent event) {
+        Block block = event.getBlock();
+        if (block.getType() != hostMaterial) return;
 
-    /**
-     * HARDCORE:
-     * Escanea TODOS los bloques en un radio alrededor del jugador,
-     * y cualquier AZALEA_LEAVES se fuerza a su textura custom correspondiente.
-     *
-     * - Usa getOrDetectLeafAt => si no estaba registrada, la detecta por distance o le asigna una.
-     */
-    public void sendAllVisualsAround(Player player, int radius) {
-        repaintHostLeavesAround(player.getLocation(), radius, player);
-    }
+        LeafType type = getOrDetectLeafAt(block.getWorld(), block.getX(), block.getY(), block.getZ());
+        if (type == null) return;
 
-    /**
-     * Tras una rotura forzada por Iris, Mojang recalcula distances durante varios ticks
-     * y puede mandar múltiples block-changes vanilla. Este estabilizador reaplica la
-     * textura custom cada "intervalTicks" mientras dure la ventana de "durationTicks".
-     */
-    private void repaintHostLeavesAround(org.bukkit.Location center, int radius, Player onlyPlayer) {
-        World world = center.getWorld();
-        if (world == null) return;
-
-        int cx = center.getBlockX();
-        int cy = center.getBlockY();
-        int cz = center.getBlockZ();
-
-        int r = radius;
-        int rSq = r * r;
-
-        int yRadius = Math.min(r, 16);
-        int minY = Math.max(world.getMinHeight(), cy - yRadius);
-        int maxY = Math.min(world.getMaxHeight() - 1, cy + yRadius);
-
-        List<Player> viewers;
-        if (onlyPlayer != null) {
-            if (!onlyPlayer.isOnline()) return;
-            viewers = Collections.singletonList(onlyPlayer);
-        } else {
-            viewers = new ArrayList<>();
-            for (Player p : world.getPlayers()) {
-                double dx = p.getLocation().getX() - center.getX();
-                double dz = p.getLocation().getZ() - center.getZ();
-                if (dx * dx + dz * dz <= rSq) {
-                    viewers.add(p);
-                }
-            }
-            if (viewers.isEmpty()) return;
-        }
-
-        int minChunkX = (cx - r) >> 4;
-        int maxChunkX = (cx + r) >> 4;
-        int minChunkZ = (cz - r) >> 4;
-        int maxChunkZ = (cz + r) >> 4;
-
-        for (int chunkX = minChunkX; chunkX <= maxChunkX; chunkX++) {
-            for (int chunkZ = minChunkZ; chunkZ <= maxChunkZ; chunkZ++) {
-                Map<BlockPos, LeafType> chunkMap = leavesByChunk.get(new ChunkKey(world.getUID(), chunkX, chunkZ));
-                if (chunkMap == null || chunkMap.isEmpty()) continue;
-
-                for (Map.Entry<BlockPos, LeafType> entry : chunkMap.entrySet()) {
-                    BlockPos pos = entry.getKey();
-                    int dx = pos.x() - cx;
-                    int dz = pos.z() - cz;
-                    if (dx * dx + dz * dz > rSq) continue;
-                    if (pos.y() < minY || pos.y() > maxY) continue;
-
-                    Block block = world.getBlockAt(pos.x(), pos.y(), pos.z());
-                    if (block.getType() != hostMaterial) continue;
-
-                    sendVisual(block, entry.getValue(), viewers);
-                }
-            }
-        }
-    }
-
-    /**
-     * Inicia un "burst" visual para un jugador:
-     * durante 'ticks' repite sendAllVisualsAround cada tick para evitar que
-     * los recalculos de distance de Mojang dejen las hojas como azalea.
-     */
-    public void startVisualBurst(Player player, int ticks, int radius) {
-        if (ticks <= 0) return;
-        UUID uuid = player.getUniqueId();
-
-        // Cancelar burst anterior si existe
-        Integer oldTask = visualBurstTasks.remove(uuid);
-        if (oldTask != null) {
-            Bukkit.getScheduler().cancelTask(oldTask);
-        }
-
-        int[] holder = new int[1];
-        holder[0] = Bukkit.getScheduler().scheduleSyncRepeatingTask(plugin, new Runnable() {
-            int remaining = ticks;
-
-            @Override
-            public void run() {
-                if (!player.isOnline() || remaining-- <= 0) {
-                    Bukkit.getScheduler().cancelTask(holder[0]);
-                    visualBurstTasks.remove(uuid);
-                    return;
-                }
-                sendAllVisualsAround(player, radius);
-            }
-        }, 0L, 1L); // delay 0L para repintar lo antes posible
-
-        visualBurstTasks.put(uuid, holder[0]);
+        applyLeafState(block, type);
+        event.setCancelled(true);
     }
 
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
