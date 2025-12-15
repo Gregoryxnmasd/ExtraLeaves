@@ -43,6 +43,9 @@ public class LeafManager implements Listener {
 
     private final ExtraLeavesPlugin plugin;
 
+    private static final int RESKIN_VIEW_RADIUS = 32;
+    private static final int MAX_RESENDS_PER_TICK = 800;
+
     // Bloque host real (Iris + plugin usan AZALEA_LEAVES)
     private final Material hostMaterial = Material.AZALEA_LEAVES;
 
@@ -56,6 +59,9 @@ public class LeafManager implements Listener {
 
     // ChunkKey -> (BlockPos -> LeafEntry)
     private final Map<ChunkKey, Map<BlockPos, LeafEntry>> leavesByChunk = new HashMap<>();
+
+    // Cola de posiciones que necesitan repintado repetido durante unos ticks
+    private final Map<BlockKey, Integer> reskinQueue = new HashMap<>();
 
     // Drops al romper con la mano
     private static class HandDrop {
@@ -91,6 +97,9 @@ public class LeafManager implements Listener {
 
         // Reconstruir datos persistidos (hojas colocadas antes del restart)
         Bukkit.getScheduler().runTask(plugin, this::rebuildLoadedChunks);
+
+        // Reloj ligero para procesar la cola de repintados sin burst masivos
+        Bukkit.getScheduler().runTaskTimer(plugin, this::processReskinQueue, 1L, 1L);
     }
 
     // ==================== CONFIG ====================
