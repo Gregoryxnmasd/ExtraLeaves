@@ -3,6 +3,7 @@ package com.extracraft.extraleaves;
 import org.bukkit.Bukkit;
 import org.bukkit.ChatColor;
 import org.bukkit.Chunk;
+import org.bukkit.Location;
 import org.bukkit.Material;
 import org.bukkit.NamespacedKey;
 import org.bukkit.World;
@@ -18,6 +19,7 @@ import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
 import org.bukkit.event.block.BlockBreakEvent;
 import org.bukkit.event.block.BlockPlaceEvent;
+import org.bukkit.event.block.BlockPhysicsEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.world.ChunkLoadEvent;
 import org.bukkit.event.world.ChunkUnloadEvent;
@@ -75,6 +77,16 @@ public class LeafManager implements Listener {
 
     // Tareas de bursts visuales por jugador
     private final Map<UUID, Integer> visualBurstTasks = new HashMap<>();
+
+    // Bursts de estabilidad local tras roturas (para evitar flickering prolongado)
+    private static class StabilityBurst {
+        int taskId;
+        int remaining;
+    }
+
+    private record StabilityKey(UUID worldId, int x, int y, int z, int radius) {}
+
+    private final Map<StabilityKey, StabilityBurst> stabilityBursts = new HashMap<>();
 
     // Claves auxiliares para map
     private record ChunkKey(UUID worldId, int x, int z) {}
@@ -400,8 +412,13 @@ public class LeafManager implements Listener {
             dropHandLoot(world, block.getLocation());
         }
 
-        // Bloque roto -> ya hay packet MULTI_BLOCK_CHANGE, el burst lo lanza LeavesPacketListener
-        // No hace falta lanzar otro aquí.
+        // Refuerzo visual: la distancia de las azaleas se recalcula en cadena durante ~1s,
+        // lo que enviaba múltiples block-changes vanilla y provocaba flickering. En vez de
+        // bursts globales, abrimos una ventana corta de estabilidad local para repintar con
+        // la textura custom mientras duren los recalculos.
+        org.bukkit.Location center = block.getLocation();
+        repaintHostLeavesAround(center, 16);
+        startStabilityBurst(center, 16, 20, 2); // 1s de estabilización, cada 2 ticks
     }
 
     @EventHandler
@@ -552,12 +569,54 @@ public class LeafManager implements Listener {
      * - Usa getOrDetectLeafAt => si no estaba registrada, la detecta por distance o le asigna una.
      */
     public void sendAllVisualsAround(Player player, int radius) {
-        World world = player.getWorld();
-        org.bukkit.Location base = player.getLocation();
+        repaintHostLeavesAround(player.getLocation(), radius, player);
+    }
 
-        int cx = base.getBlockX();
-        int cy = base.getBlockY();
-        int cz = base.getBlockZ();
+    /**
+     * Tras una rotura forzada por Iris, Mojang recalcula distances durante varios ticks
+     * y puede mandar múltiples block-changes vanilla. Este estabilizador reaplica la
+     * textura custom cada "intervalTicks" mientras dure la ventana de "durationTicks".
+     */
+    private void startStabilityBurst(Location center, int radius, int durationTicks, int intervalTicks) {
+        World world = center.getWorld();
+        if (world == null || durationTicks <= 0 || intervalTicks <= 0) return;
+
+        StabilityKey key = new StabilityKey(world.getUID(), center.getBlockX(), center.getBlockY(), center.getBlockZ(), radius);
+        StabilityBurst existing = stabilityBursts.get(key);
+        if (existing != null) {
+            existing.remaining = Math.max(existing.remaining, durationTicks);
+            return;
+        }
+
+        Location origin = center.clone();
+        StabilityBurst burst = new StabilityBurst();
+        burst.remaining = durationTicks;
+
+        burst.taskId = Bukkit.getScheduler().scheduleSyncRepeatingTask(plugin, () -> {
+            if (burst.remaining <= 0) {
+                Bukkit.getScheduler().cancelTask(burst.taskId);
+                stabilityBursts.remove(key);
+                return;
+            }
+
+            burst.remaining -= intervalTicks;
+            repaintHostLeavesAround(origin, radius);
+        }, 0L, intervalTicks);
+
+        stabilityBursts.put(key, burst);
+    }
+
+    private void repaintHostLeavesAround(org.bukkit.Location center, int radius) {
+        repaintHostLeavesAround(center, radius, null);
+    }
+
+    private void repaintHostLeavesAround(org.bukkit.Location center, int radius, Player onlyPlayer) {
+        World world = center.getWorld();
+        if (world == null) return;
+
+        int cx = center.getBlockX();
+        int cy = center.getBlockY();
+        int cz = center.getBlockZ();
 
         int r = radius;
         int rSq = r * r;
@@ -565,6 +624,22 @@ public class LeafManager implements Listener {
         int yRadius = Math.min(r, 16);
         int minY = Math.max(world.getMinHeight(), cy - yRadius);
         int maxY = Math.min(world.getMaxHeight() - 1, cy + yRadius);
+
+        List<Player> viewers;
+        if (onlyPlayer != null) {
+            if (!onlyPlayer.isOnline()) return;
+            viewers = Collections.singletonList(onlyPlayer);
+        } else {
+            viewers = new ArrayList<>();
+            for (Player p : world.getPlayers()) {
+                double dx = p.getLocation().getX() - center.getX();
+                double dz = p.getLocation().getZ() - center.getZ();
+                if (dx * dx + dz * dz <= rSq) {
+                    viewers.add(p);
+                }
+            }
+            if (viewers.isEmpty()) return;
+        }
 
         for (int x = cx - r; x <= cx + r; x++) {
             for (int z = cz - r; z <= cz + r; z++) {
@@ -579,7 +654,7 @@ public class LeafManager implements Listener {
                     LeafType type = getOrDetectLeafAt(world, x, y, z);
                     if (type == null) continue;
 
-                    player.sendBlockChange(block.getLocation(), type.visualData());
+                    sendVisual(block, type, viewers);
                 }
             }
         }
@@ -616,6 +691,45 @@ public class LeafManager implements Listener {
         }, 0L, 1L); // delay 0L para repintar lo antes posible
 
         visualBurstTasks.put(uuid, holder[0]);
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onLeafPhysics(BlockPhysicsEvent event) {
+        Block block = event.getBlock();
+        if (block.getType() != hostMaterial) return;
+
+        LeafType type = getOrDetectLeafAt(block.getWorld(), block.getX(), block.getY(), block.getZ());
+        if (type == null) return;
+
+        sendVisual(block, type, getNearbyViewers(block.getLocation(), 32));
+        startStabilityBurst(block.getLocation(), 12, 10, 2);
+    }
+
+    private List<Player> getNearbyViewers(org.bukkit.Location center, int radius) {
+        World world = center.getWorld();
+        if (world == null) return Collections.emptyList();
+
+        int rSq = radius * radius;
+        List<Player> viewers = new ArrayList<>();
+        for (Player player : world.getPlayers()) {
+            if (!player.isOnline()) continue;
+            double dx = player.getLocation().getX() - center.getX();
+            double dz = player.getLocation().getZ() - center.getZ();
+            if (dx * dx + dz * dz <= rSq) {
+                viewers.add(player);
+            }
+        }
+        return viewers;
+    }
+
+    private void sendVisual(Block block, LeafType type, Collection<Player> viewers) {
+        if (viewers == null || viewers.isEmpty()) return;
+        org.bukkit.Location loc = block.getLocation();
+        for (Player viewer : viewers) {
+            if (viewer.isOnline()) {
+                viewer.sendBlockChange(loc, type.visualData());
+            }
+        }
     }
 
     private void rebuildLoadedChunks() {
