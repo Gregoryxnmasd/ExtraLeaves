@@ -1,6 +1,5 @@
 package com.extracraft.extraleaves;
 
-import com.github.retrooper.packetevents.PacketEvents;
 import org.bukkit.command.PluginCommand;
 import org.bukkit.plugin.java.JavaPlugin;
 
@@ -31,14 +30,6 @@ public class ExtraLeavesPlugin extends JavaPlugin {
         this.leafManager = new LeafManager(this);
         this.packGenerator = new PackGenerator(this, leafManager);
 
-        // Inicializar PacketEvents (2.11.0) – SIN create(), usando getAPI()
-        PacketEvents.getAPI().init();
-
-        // Registrar listener de packets
-        PacketEvents.getAPI()
-                .getEventManager()
-                .registerListener(new LeavesPacketListener(this, leafManager));
-
         // Comando /extraleaves
         PluginCommand cmd = getCommand("extraleaves");
         if (cmd != null) {
@@ -62,11 +53,6 @@ public class ExtraLeavesPlugin extends JavaPlugin {
 
     @Override
     public void onDisable() {
-        try {
-            PacketEvents.getAPI().terminate();
-        } catch (Exception ex) {
-            getLogger().warning("Error al terminar PacketEvents: " + ex.getMessage());
-        }
         getLogger().info("ExtraLeaves deshabilitado.");
     }
 
