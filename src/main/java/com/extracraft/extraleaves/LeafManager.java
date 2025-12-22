@@ -380,7 +380,8 @@ public class LeafManager implements Listener {
         if (type == null) return;
 
         Block block = event.getBlockPlaced();
-        block.setType(hostMaterial, false);
+        BlockData visual = type.visual().clone();
+        block.setBlockData(visual, false);
 
         registerLeafAt(block, type);
     }
