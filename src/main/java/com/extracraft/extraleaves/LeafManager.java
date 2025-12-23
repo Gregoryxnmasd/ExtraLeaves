@@ -49,11 +49,11 @@ public class LeafManager implements Listener {
     private static final int RESKIN_VIEW_RADIUS = 32;
     private static final int MAX_RESENDS_PER_TICK = 800;
 
-    private static final int PARTICLE_TICK_INTERVAL = 10;
-    private static final int PARTICLE_CHUNK_RADIUS = 2;
+    private static final int PARTICLE_TICK_INTERVAL = 5;
+    private static final int PARTICLE_CHUNK_RADIUS = 3;
     private static final int MAX_PARTICLES_PER_TICK = 40;
     private static final int MAX_PARTICLES_PER_PLAYER = 3;
-    private static final double PARTICLE_PLAYER_RADIUS = 32.0;
+    private static final double PARTICLE_PLAYER_RADIUS = 48.0;
     private static final double PARTICLE_PLAYER_RADIUS_SQUARED = PARTICLE_PLAYER_RADIUS * PARTICLE_PLAYER_RADIUS;
     private static final double PARTICLE_FALL_SPEED = 0.02;
     private static final double PARTICLE_DRIFT = 0.02;
@@ -73,6 +73,8 @@ public class LeafManager implements Listener {
 
     // ChunkKey -> (BlockKey -> LeafEntry)
     private final Map<ChunkKey, Map<BlockKey, LeafEntry>> leavesByChunk = new HashMap<>();
+    // ChunkKey -> (BlockKey -> LeafEntry) solo hojas colocadas por jugador
+    private final Map<ChunkKey, Map<BlockKey, LeafEntry>> customLeavesByChunk = new HashMap<>();
 
     // Drops al romper con la mano
     private static class HandDrop {
@@ -255,6 +257,7 @@ public class LeafManager implements Listener {
         byId.clear();
         byDistance.clear();
         leavesByChunk.clear();
+        customLeavesByChunk.clear();
         handDrops.clear();
 
         plugin.reloadConfig();
@@ -334,6 +337,20 @@ public class LeafManager implements Listener {
         LeafEntry previous = map.put(pos, new LeafEntry(type, persistent));
         applyLeafState(block, type);
 
+        if (persistent) {
+            customLeavesByChunk
+                    .computeIfAbsent(chunkKey(chunk), key -> new HashMap<>())
+                    .put(pos, new LeafEntry(type, true));
+        } else {
+            Map<BlockKey, LeafEntry> customMap = customLeavesByChunk.get(chunkKey(chunk));
+            if (customMap != null) {
+                customMap.remove(pos);
+                if (customMap.isEmpty()) {
+                    customLeavesByChunk.remove(chunkKey(chunk));
+                }
+            }
+        }
+
         if (!savePersistentChanges) {
             return;
         }
@@ -354,6 +371,13 @@ public class LeafManager implements Listener {
         if (map == null) return;
 
         LeafEntry removed = map.remove(blockPos(block));
+        Map<BlockKey, LeafEntry> customMap = customLeavesByChunk.get(chunkKey(chunk));
+        if (customMap != null) {
+            customMap.remove(blockPos(block));
+            if (customMap.isEmpty()) {
+                customLeavesByChunk.remove(chunkKey(chunk));
+            }
+        }
         if (removed != null && removed.persistent()) {
             saveChunkData(chunk, map);
         }
@@ -480,6 +504,10 @@ public class LeafManager implements Listener {
 
         Map<BlockKey, LeafEntry> map = loadChunkData(chunk);
         leavesByChunk.put(key, map);
+        Map<BlockKey, LeafEntry> customMap = extractPersistentLeaves(map);
+        if (!customMap.isEmpty()) {
+            customLeavesByChunk.put(key, customMap);
+        }
 
         // Detectar hojas de Iris sin persistirlas
         scanChunkForHostLeaves(chunk, map);
@@ -487,7 +515,9 @@ public class LeafManager implements Listener {
 
     @EventHandler
     public void onChunkUnload(ChunkUnloadEvent event) {
-        leavesByChunk.remove(chunkKey(event.getChunk()));
+        ChunkKey key = chunkKey(event.getChunk());
+        leavesByChunk.remove(key);
+        customLeavesByChunk.remove(key);
     }
 
     @EventHandler
@@ -667,6 +697,16 @@ public class LeafManager implements Listener {
         return map;
     }
 
+    private Map<BlockKey, LeafEntry> extractPersistentLeaves(Map<BlockKey, LeafEntry> map) {
+        Map<BlockKey, LeafEntry> customMap = new HashMap<>();
+        for (Map.Entry<BlockKey, LeafEntry> entry : map.entrySet()) {
+            if (entry.getValue().persistent()) {
+                customMap.put(entry.getKey(), entry.getValue());
+            }
+        }
+        return customMap;
+    }
+
     /**
      * Fallback manual refresher usado por comandos o depuración externa.
      * Reaplica el estado custom a todas las hojas rastreadas en chunks cargados.
@@ -692,7 +732,7 @@ public class LeafManager implements Listener {
     }
 
     private void spawnLeafParticles() {
-        if (leavesByChunk.isEmpty()) {
+        if (customLeavesByChunk.isEmpty()) {
             return;
         }
 
@@ -724,7 +764,7 @@ public class LeafManager implements Listener {
             for (int attempt = 0; attempt < attempts; attempt++) {
                 int cx = baseChunkX + rnd.nextInt(-PARTICLE_CHUNK_RADIUS, PARTICLE_CHUNK_RADIUS + 1);
                 int cz = baseChunkZ + rnd.nextInt(-PARTICLE_CHUNK_RADIUS, PARTICLE_CHUNK_RADIUS + 1);
-                Map<BlockKey, LeafEntry> map = leavesByChunk.get(new ChunkKey(world.getUID(), cx, cz));
+                Map<BlockKey, LeafEntry> map = customLeavesByChunk.get(new ChunkKey(world.getUID(), cx, cz));
                 if (map == null || map.isEmpty()) {
                     continue;
                 }
@@ -735,9 +775,6 @@ public class LeafManager implements Listener {
                 }
 
                 LeafEntry entry = selection.getValue();
-                if (!entry.persistent()) {
-                    continue;
-                }
 
                 BlockKey pos = selection.getKey();
                 double dx = (pos.x() + 0.5) - playerLoc.getX();
@@ -758,21 +795,16 @@ public class LeafManager implements Listener {
                 int amount = entry.type().particleAmount();
                 if (amount <= 0) continue;
 
-                int spawnCount = 1;
-                if (amount > 1) {
-                    spawnCount = 1 + rnd.nextInt(amount);
+                int spawnCount = Math.min(amount, Math.min(remaining, perPlayer));
+                List<BlockKey> targets = collectLeafTargets(world, playerLoc, entry.type(), spawnCount, rnd);
+                for (BlockKey target : targets) {
+                    spawnLeafParticle(player, entry.type(), target, rnd);
                 }
-                spawnCount = Math.min(spawnCount, remaining);
-
-                for (int i = 0; i < spawnCount; i++) {
-                    spawnLeafParticle(player, entry.type(), pos, rnd);
-                }
-                remaining -= spawnCount;
+                remaining -= targets.size();
+                perPlayer -= targets.size();
                 if (remaining <= 0) {
                     break;
                 }
-
-                perPlayer--;
                 if (perPlayer <= 0) {
                     break;
                 }
@@ -815,6 +847,59 @@ public class LeafManager implements Listener {
                 1.0,
                 color
         );
+    }
+
+    private List<BlockKey> collectLeafTargets(World world, Location playerLoc, LeafType type, int count, ThreadLocalRandom rnd) {
+        if (count <= 0) {
+            return List.of();
+        }
+
+        List<BlockKey> targets = new ArrayList<>(count);
+        Set<BlockKey> seen = new HashSet<>(count * 2);
+        int baseChunkX = playerLoc.getBlockX() >> 4;
+        int baseChunkZ = playerLoc.getBlockZ() >> 4;
+
+        int attempts = count * PARTICLE_ATTEMPTS_MULTIPLIER;
+        for (int attempt = 0; attempt < attempts && targets.size() < count; attempt++) {
+            int cx = baseChunkX + rnd.nextInt(-PARTICLE_CHUNK_RADIUS, PARTICLE_CHUNK_RADIUS + 1);
+            int cz = baseChunkZ + rnd.nextInt(-PARTICLE_CHUNK_RADIUS, PARTICLE_CHUNK_RADIUS + 1);
+            Map<BlockKey, LeafEntry> map = customLeavesByChunk.get(new ChunkKey(world.getUID(), cx, cz));
+            if (map == null || map.isEmpty()) {
+                continue;
+            }
+
+            Map.Entry<BlockKey, LeafEntry> selection = pickRandomLeaf(map, rnd);
+            if (selection == null) {
+                continue;
+            }
+
+            LeafEntry entry = selection.getValue();
+            if (entry.type() != type) {
+                continue;
+            }
+
+            BlockKey pos = selection.getKey();
+            if (seen.contains(pos)) {
+                continue;
+            }
+
+            double dx = (pos.x() + 0.5) - playerLoc.getX();
+            double dy = (pos.y() + 0.5) - playerLoc.getY();
+            double dz = (pos.z() + 0.5) - playerLoc.getZ();
+            if ((dx * dx + dy * dy + dz * dz) > PARTICLE_PLAYER_RADIUS_SQUARED) {
+                continue;
+            }
+
+            Block block = world.getBlockAt(pos.x(), pos.y(), pos.z());
+            if (block.getType() != hostMaterial || !hasAirBelow(block)) {
+                continue;
+            }
+
+            seen.add(pos);
+            targets.add(pos);
+        }
+
+        return targets;
     }
 
     private boolean hasAirBelow(Block block) {
