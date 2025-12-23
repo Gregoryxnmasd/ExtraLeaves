@@ -1,5 +1,6 @@
 package com.extracraft.extraleaves;
 
+import org.bukkit.Color;
 import org.bukkit.block.data.BlockData;
 
 /**
@@ -12,6 +13,8 @@ import org.bukkit.block.data.BlockData;
  *  - texture: nombre de la textura (archivo PNG sin la extensión)
  *  - customModelData: valor para el item en el inventario (para overrides de modelo)
  *  - visualData: BlockData que se enviará al cliente (PacketEvents o sendBlockChange)
+ *  - particleColor: color de las partículas de hojas cayendo
+ *  - particleAmount: cantidad de partículas por tick cuando se elige esta hoja
  */
 public record LeafType(
         String id,
@@ -19,6 +22,8 @@ public record LeafType(
         int distanceId,
         String texture,
         int customModelData,
-        BlockData visualData
+        BlockData visualData,
+        Color particleColor,
+        int particleAmount
 ) {
 }
