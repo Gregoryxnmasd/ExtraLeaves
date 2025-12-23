@@ -11,6 +11,7 @@ depend:
 commands:
   extraleaves:
     description: "Comandos de ExtraLeaves"
+    aliases: [leaves]
     usage: "/extraleaves"
     permission: "extraleaves.use"
 

@@ -529,13 +529,16 @@ public class LeafManager implements Listener {
 
         Map<BlockKey, LeafEntry> map = loadChunkData(chunk);
         leavesByChunk.put(key, map);
-        Map<BlockKey, LeafEntry> particleMap = extractPersistentLeaves(map);
-        if (!particleMap.isEmpty()) {
-            particleLeavesByChunk.put(key, particleMap);
-        }
+        Map<BlockKey, LeafEntry> particleMap = new HashMap<>(extractPersistentLeaves(map));
 
         // Detectar hojas de Iris sin persistirlas
         scanChunkForHostLeaves(chunk, map, particleMap);
+
+        if (!particleMap.isEmpty()) {
+            particleLeavesByChunk.put(key, particleMap);
+        } else {
+            particleLeavesByChunk.remove(key);
+        }
     }
 
     @EventHandler
