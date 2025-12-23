@@ -60,6 +60,7 @@ public class LeafManager implements Listener {
     private int maxParticlesPerPlayer = 3;
     private double particlePlayerRadius = 48.0;
     private double particlePlayerRadiusSquared = particlePlayerRadius * particlePlayerRadius;
+    private int maxParticleAmount = 1;
 
     // Bloque host real (Iris + plugin usan AZALEA_LEAVES)
     private final Material hostMaterial = Material.AZALEA_LEAVES;
@@ -135,6 +136,7 @@ public class LeafManager implements Listener {
             return;
         }
 
+        maxParticleAmount = 1;
         for (String key : sec.getKeys(false)) {
             ConfigurationSection leafSec = sec.getConfigurationSection(key);
             if (leafSec == null) continue;
@@ -179,6 +181,7 @@ public class LeafManager implements Listener {
 
             byId.put(type.id(), type);
             byDistance.put(distanceId, type);
+            maxParticleAmount = Math.max(maxParticleAmount, particleAmount);
         }
 
         plugin.getLogger().info("ExtraLeaves: cargados " + byId.size() + " tipos de hojas.");
@@ -783,6 +786,7 @@ public class LeafManager implements Listener {
 
             int perPlayer = Math.min(maxParticlesPerPlayer, remaining);
             int attempts = perPlayer * PARTICLE_ATTEMPTS_MULTIPLIER;
+            Set<BlockKey> used = new HashSet<>(perPlayer * 2);
             for (int attempt = 0; attempt < attempts; attempt++) {
                 int cx = baseChunkX + rnd.nextInt(-particleChunkRadius, particleChunkRadius + 1);
                 int cz = baseChunkZ + rnd.nextInt(-particleChunkRadius, particleChunkRadius + 1);
@@ -799,6 +803,9 @@ public class LeafManager implements Listener {
                 LeafEntry entry = selection.getValue();
 
                 BlockKey pos = selection.getKey();
+                if (used.contains(pos)) {
+                    continue;
+                }
                 double dx = (pos.x() + 0.5) - playerLoc.getX();
                 double dy = (pos.y() + 0.5) - playerLoc.getY();
                 double dz = (pos.z() + 0.5) - playerLoc.getZ();
@@ -814,16 +821,14 @@ public class LeafManager implements Listener {
                     continue;
                 }
 
-                int amount = entry.type().particleAmount();
-                if (amount <= 0) continue;
-
-                int spawnCount = Math.min(amount, Math.min(remaining, perPlayer));
-                List<BlockKey> targets = collectLeafTargets(world, playerLoc, entry.type(), spawnCount, rnd);
-                for (BlockKey target : targets) {
-                    spawnLeafParticle(player, entry.type(), target, rnd);
+                if (!shouldSpawnParticle(entry.type(), rnd)) {
+                    continue;
                 }
-                remaining -= targets.size();
-                perPlayer -= targets.size();
+
+                spawnLeafParticle(player, entry.type(), pos, rnd);
+                used.add(pos);
+                remaining--;
+                perPlayer--;
                 if (remaining <= 0) {
                     break;
                 }
@@ -871,60 +876,16 @@ public class LeafManager implements Listener {
         );
     }
 
-    private List<BlockKey> collectLeafTargets(World world, Location playerLoc, LeafType type, int count, ThreadLocalRandom rnd) {
-        if (count <= 0) {
-            return List.of();
-        }
-
-        List<BlockKey> targets = new ArrayList<>(count);
-        Set<BlockKey> seen = new HashSet<>(count * 2);
-        int baseChunkX = playerLoc.getBlockX() >> 4;
-        int baseChunkZ = playerLoc.getBlockZ() >> 4;
-
-        int attempts = count * PARTICLE_ATTEMPTS_MULTIPLIER;
-        for (int attempt = 0; attempt < attempts && targets.size() < count; attempt++) {
-            int cx = baseChunkX + rnd.nextInt(-particleChunkRadius, particleChunkRadius + 1);
-            int cz = baseChunkZ + rnd.nextInt(-particleChunkRadius, particleChunkRadius + 1);
-            Map<BlockKey, LeafEntry> map = customLeavesByChunk.get(new ChunkKey(world.getUID(), cx, cz));
-            if (map == null || map.isEmpty()) {
-                continue;
-            }
-
-            Map.Entry<BlockKey, LeafEntry> selection = pickRandomLeaf(map, rnd);
-            if (selection == null) {
-                continue;
-            }
-
-            LeafEntry entry = selection.getValue();
-            if (entry.type() != type) {
-                continue;
-            }
-
-            BlockKey pos = selection.getKey();
-            if (seen.contains(pos)) {
-                continue;
-            }
-
-            double dx = (pos.x() + 0.5) - playerLoc.getX();
-            double dy = (pos.y() + 0.5) - playerLoc.getY();
-            double dz = (pos.z() + 0.5) - playerLoc.getZ();
-            if ((dx * dx + dy * dy + dz * dz) > particlePlayerRadiusSquared) {
-                continue;
-            }
-
-            Block block = world.getBlockAt(pos.x(), pos.y(), pos.z());
-            if (block.getType() != hostMaterial || !hasAirBelow(block)) {
-                continue;
-            }
-
-            seen.add(pos);
-            targets.add(pos);
-        }
-
-        return targets;
-    }
-
     private boolean hasAirBelow(Block block) {
         return block.getRelative(BlockFace.DOWN).getType().isAir();
+    }
+
+    private boolean shouldSpawnParticle(LeafType type, ThreadLocalRandom rnd) {
+        int amount = type.particleAmount();
+        if (amount <= 0) {
+            return false;
+        }
+        int max = Math.max(1, maxParticleAmount);
+        return rnd.nextInt(max) < amount;
     }
 }
