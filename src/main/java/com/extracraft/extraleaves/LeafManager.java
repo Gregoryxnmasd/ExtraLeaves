@@ -3,11 +3,14 @@ package com.extracraft.extraleaves;
 import org.bukkit.Bukkit;
 import org.bukkit.ChatColor;
 import org.bukkit.Chunk;
+import org.bukkit.Color;
 import org.bukkit.Location;
 import org.bukkit.Material;
 import org.bukkit.NamespacedKey;
+import org.bukkit.Particle;
 import org.bukkit.World;
 import org.bukkit.block.Block;
+import org.bukkit.block.BlockFace;
 import org.bukkit.block.data.BlockData;
 import org.bukkit.block.data.type.Leaves;
 import org.bukkit.configuration.ConfigurationSection;
@@ -46,6 +49,17 @@ public class LeafManager implements Listener {
     private static final int RESKIN_VIEW_RADIUS = 32;
     private static final int MAX_RESENDS_PER_TICK = 800;
 
+    private static final int PARTICLE_TICK_INTERVAL = 5;
+    private static final int PARTICLE_CHUNK_RADIUS = 3;
+    private static final int MAX_PARTICLES_PER_TICK = 40;
+    private static final int MAX_PARTICLES_PER_PLAYER = 3;
+    private static final double PARTICLE_PLAYER_RADIUS = 48.0;
+    private static final double PARTICLE_PLAYER_RADIUS_SQUARED = PARTICLE_PLAYER_RADIUS * PARTICLE_PLAYER_RADIUS;
+    private static final double PARTICLE_FALL_SPEED = 0.02;
+    private static final double PARTICLE_DRIFT = 0.02;
+    private static final double PARTICLE_DOWNWARD_SPEED = -0.04;
+    private static final int PARTICLE_ATTEMPTS_MULTIPLIER = 4;
+
     // Bloque host real (Iris + plugin usan AZALEA_LEAVES)
     private final Material hostMaterial = Material.AZALEA_LEAVES;
 
@@ -59,6 +73,8 @@ public class LeafManager implements Listener {
 
     // ChunkKey -> (BlockKey -> LeafEntry)
     private final Map<ChunkKey, Map<BlockKey, LeafEntry>> leavesByChunk = new HashMap<>();
+    // ChunkKey -> (BlockKey -> LeafEntry) solo hojas colocadas por jugador
+    private final Map<ChunkKey, Map<BlockKey, LeafEntry>> customLeavesByChunk = new HashMap<>();
 
     // Drops al romper con la mano
     private static class HandDrop {
@@ -97,6 +113,9 @@ public class LeafManager implements Listener {
 
         // Reloj ligero para procesar la cola de repintados sin burst masivos
         Bukkit.getScheduler().runTaskTimer(plugin, this::processReskinQueue, 1L, 1L);
+
+        // Partículas suaves de hojas cayendo (solo hojas colocadas)
+        Bukkit.getScheduler().runTaskTimer(plugin, this::spawnLeafParticles, PARTICLE_TICK_INTERVAL, PARTICLE_TICK_INTERVAL);
     }
 
     // ==================== CONFIG ====================
@@ -123,6 +142,8 @@ public class LeafManager implements Listener {
             String texture = leafSec.getString("texture", id);
             int distanceId = leafSec.getInt("distance-id", 2);
             int customModelData = leafSec.getInt("custom-model-data", 0);
+            Color particleColor = parseParticleColor(leafSec.getString("particle-color", "#FFFFFF"), id);
+            int particleAmount = Math.max(0, leafSec.getInt("particle-amount", 1));
 
             if (distanceId < 1 || distanceId > 7) {
                 plugin.getLogger().warning("distance-id inválido en " + id + " (1..7). Se ignora.");
@@ -149,7 +170,9 @@ public class LeafManager implements Listener {
                     distanceId,
                     texture,
                     customModelData,
-                    visual
+                    visual,
+                    particleColor,
+                    particleAmount
             );
 
             byId.put(type.id(), type);
@@ -157,6 +180,41 @@ public class LeafManager implements Listener {
         }
 
         plugin.getLogger().info("ExtraLeaves: cargados " + byId.size() + " tipos de hojas.");
+    }
+
+    private Color parseParticleColor(String raw, String leafId) {
+        if (raw == null || raw.isBlank()) {
+            return Color.WHITE;
+        }
+
+        String trimmed = raw.trim();
+        if (trimmed.startsWith("#")) {
+            trimmed = trimmed.substring(1);
+        }
+
+        if (trimmed.matches("(?i)[0-9a-f]{6}")) {
+            int rgb = Integer.parseInt(trimmed, 16);
+            return Color.fromRGB(rgb);
+        }
+
+        String[] parts = trimmed.split(",");
+        if (parts.length == 3) {
+            try {
+                int r = clampColorComponent(Integer.parseInt(parts[0].trim()));
+                int g = clampColorComponent(Integer.parseInt(parts[1].trim()));
+                int b = clampColorComponent(Integer.parseInt(parts[2].trim()));
+                return Color.fromRGB(r, g, b);
+            } catch (NumberFormatException ignored) {
+                // fallback below
+            }
+        }
+
+        plugin.getLogger().warning("particle-color inválido para " + leafId + ": " + raw + " (usando blanco).");
+        return Color.WHITE;
+    }
+
+    private int clampColorComponent(int value) {
+        return Math.max(0, Math.min(255, value));
     }
 
     private void loadHandDropsFromConfig() {
@@ -199,6 +257,7 @@ public class LeafManager implements Listener {
         byId.clear();
         byDistance.clear();
         leavesByChunk.clear();
+        customLeavesByChunk.clear();
         handDrops.clear();
 
         plugin.reloadConfig();
@@ -278,6 +337,20 @@ public class LeafManager implements Listener {
         LeafEntry previous = map.put(pos, new LeafEntry(type, persistent));
         applyLeafState(block, type);
 
+        if (persistent) {
+            customLeavesByChunk
+                    .computeIfAbsent(chunkKey(chunk), key -> new HashMap<>())
+                    .put(pos, new LeafEntry(type, true));
+        } else {
+            Map<BlockKey, LeafEntry> customMap = customLeavesByChunk.get(chunkKey(chunk));
+            if (customMap != null) {
+                customMap.remove(pos);
+                if (customMap.isEmpty()) {
+                    customLeavesByChunk.remove(chunkKey(chunk));
+                }
+            }
+        }
+
         if (!savePersistentChanges) {
             return;
         }
@@ -298,6 +371,13 @@ public class LeafManager implements Listener {
         if (map == null) return;
 
         LeafEntry removed = map.remove(blockPos(block));
+        Map<BlockKey, LeafEntry> customMap = customLeavesByChunk.get(chunkKey(chunk));
+        if (customMap != null) {
+            customMap.remove(blockPos(block));
+            if (customMap.isEmpty()) {
+                customLeavesByChunk.remove(chunkKey(chunk));
+            }
+        }
         if (removed != null && removed.persistent()) {
             saveChunkData(chunk, map);
         }
@@ -424,6 +504,10 @@ public class LeafManager implements Listener {
 
         Map<BlockKey, LeafEntry> map = loadChunkData(chunk);
         leavesByChunk.put(key, map);
+        Map<BlockKey, LeafEntry> customMap = extractPersistentLeaves(map);
+        if (!customMap.isEmpty()) {
+            customLeavesByChunk.put(key, customMap);
+        }
 
         // Detectar hojas de Iris sin persistirlas
         scanChunkForHostLeaves(chunk, map);
@@ -431,7 +515,9 @@ public class LeafManager implements Listener {
 
     @EventHandler
     public void onChunkUnload(ChunkUnloadEvent event) {
-        leavesByChunk.remove(chunkKey(event.getChunk()));
+        ChunkKey key = chunkKey(event.getChunk());
+        leavesByChunk.remove(key);
+        customLeavesByChunk.remove(key);
     }
 
     @EventHandler
@@ -611,6 +697,16 @@ public class LeafManager implements Listener {
         return map;
     }
 
+    private Map<BlockKey, LeafEntry> extractPersistentLeaves(Map<BlockKey, LeafEntry> map) {
+        Map<BlockKey, LeafEntry> customMap = new HashMap<>();
+        for (Map.Entry<BlockKey, LeafEntry> entry : map.entrySet()) {
+            if (entry.getValue().persistent()) {
+                customMap.put(entry.getKey(), entry.getValue());
+            }
+        }
+        return customMap;
+    }
+
     /**
      * Fallback manual refresher usado por comandos o depuración externa.
      * Reaplica el estado custom a todas las hojas rastreadas en chunks cargados.
@@ -633,5 +729,180 @@ public class LeafManager implements Listener {
                 applyLeafState(world.getBlockAt(pos.x(), pos.y(), pos.z()), leafEntry.type());
             }
         }
+    }
+
+    private void spawnLeafParticles() {
+        if (customLeavesByChunk.isEmpty()) {
+            return;
+        }
+
+        Collection<? extends Player> players = Bukkit.getOnlinePlayers();
+        if (players.isEmpty()) {
+            return;
+        }
+
+        int remaining = MAX_PARTICLES_PER_TICK;
+        ThreadLocalRandom rnd = ThreadLocalRandom.current();
+
+        for (Player player : players) {
+            if (remaining <= 0) {
+                break;
+            }
+            if (!player.isOnline() || player.isDead()) {
+                continue;
+            }
+
+            Location playerLoc = player.getLocation();
+            World world = playerLoc.getWorld();
+            if (world == null) continue;
+
+            int baseChunkX = playerLoc.getBlockX() >> 4;
+            int baseChunkZ = playerLoc.getBlockZ() >> 4;
+
+            int perPlayer = Math.min(MAX_PARTICLES_PER_PLAYER, remaining);
+            int attempts = perPlayer * PARTICLE_ATTEMPTS_MULTIPLIER;
+            for (int attempt = 0; attempt < attempts; attempt++) {
+                int cx = baseChunkX + rnd.nextInt(-PARTICLE_CHUNK_RADIUS, PARTICLE_CHUNK_RADIUS + 1);
+                int cz = baseChunkZ + rnd.nextInt(-PARTICLE_CHUNK_RADIUS, PARTICLE_CHUNK_RADIUS + 1);
+                Map<BlockKey, LeafEntry> map = customLeavesByChunk.get(new ChunkKey(world.getUID(), cx, cz));
+                if (map == null || map.isEmpty()) {
+                    continue;
+                }
+
+                Map.Entry<BlockKey, LeafEntry> selection = pickRandomLeaf(map, rnd);
+                if (selection == null) {
+                    continue;
+                }
+
+                LeafEntry entry = selection.getValue();
+
+                BlockKey pos = selection.getKey();
+                double dx = (pos.x() + 0.5) - playerLoc.getX();
+                double dy = (pos.y() + 0.5) - playerLoc.getY();
+                double dz = (pos.z() + 0.5) - playerLoc.getZ();
+                if ((dx * dx + dy * dy + dz * dz) > PARTICLE_PLAYER_RADIUS_SQUARED) {
+                    continue;
+                }
+
+                Block block = world.getBlockAt(pos.x(), pos.y(), pos.z());
+                if (block.getType() != hostMaterial) {
+                    continue;
+                }
+                if (!hasAirBelow(block)) {
+                    continue;
+                }
+
+                int amount = entry.type().particleAmount();
+                if (amount <= 0) continue;
+
+                int spawnCount = Math.min(amount, Math.min(remaining, perPlayer));
+                List<BlockKey> targets = collectLeafTargets(world, playerLoc, entry.type(), spawnCount, rnd);
+                for (BlockKey target : targets) {
+                    spawnLeafParticle(player, entry.type(), target, rnd);
+                }
+                remaining -= targets.size();
+                perPlayer -= targets.size();
+                if (remaining <= 0) {
+                    break;
+                }
+                if (perPlayer <= 0) {
+                    break;
+                }
+            }
+        }
+    }
+
+    private Map.Entry<BlockKey, LeafEntry> pickRandomLeaf(Map<BlockKey, LeafEntry> map, ThreadLocalRandom rnd) {
+        if (map.isEmpty()) return null;
+        int target = rnd.nextInt(map.size());
+        int index = 0;
+        for (Map.Entry<BlockKey, LeafEntry> entry : map.entrySet()) {
+            if (index++ == target) {
+                return entry;
+            }
+        }
+        return null;
+    }
+
+    private void spawnLeafParticle(Player player, LeafType type, BlockKey pos, ThreadLocalRandom rnd) {
+        Color color = type.particleColor();
+
+        double x = pos.x() + 0.2 + rnd.nextDouble() * 0.6;
+        double y = pos.y() - 0.2 + rnd.nextDouble() * 0.2;
+        double z = pos.z() + 0.2 + rnd.nextDouble() * 0.6;
+
+        double vx = (rnd.nextDouble() - 0.5) * PARTICLE_DRIFT;
+        double vz = (rnd.nextDouble() - 0.5) * PARTICLE_DRIFT;
+        double vy = PARTICLE_DOWNWARD_SPEED - rnd.nextDouble() * PARTICLE_FALL_SPEED;
+
+        player.spawnParticle(
+                Particle.TINTED_LEAVES,
+                x,
+                y,
+                z,
+                0,
+                vx,
+                vy,
+                vz,
+                1.0,
+                color
+        );
+    }
+
+    private List<BlockKey> collectLeafTargets(World world, Location playerLoc, LeafType type, int count, ThreadLocalRandom rnd) {
+        if (count <= 0) {
+            return List.of();
+        }
+
+        List<BlockKey> targets = new ArrayList<>(count);
+        Set<BlockKey> seen = new HashSet<>(count * 2);
+        int baseChunkX = playerLoc.getBlockX() >> 4;
+        int baseChunkZ = playerLoc.getBlockZ() >> 4;
+
+        int attempts = count * PARTICLE_ATTEMPTS_MULTIPLIER;
+        for (int attempt = 0; attempt < attempts && targets.size() < count; attempt++) {
+            int cx = baseChunkX + rnd.nextInt(-PARTICLE_CHUNK_RADIUS, PARTICLE_CHUNK_RADIUS + 1);
+            int cz = baseChunkZ + rnd.nextInt(-PARTICLE_CHUNK_RADIUS, PARTICLE_CHUNK_RADIUS + 1);
+            Map<BlockKey, LeafEntry> map = customLeavesByChunk.get(new ChunkKey(world.getUID(), cx, cz));
+            if (map == null || map.isEmpty()) {
+                continue;
+            }
+
+            Map.Entry<BlockKey, LeafEntry> selection = pickRandomLeaf(map, rnd);
+            if (selection == null) {
+                continue;
+            }
+
+            LeafEntry entry = selection.getValue();
+            if (entry.type() != type) {
+                continue;
+            }
+
+            BlockKey pos = selection.getKey();
+            if (seen.contains(pos)) {
+                continue;
+            }
+
+            double dx = (pos.x() + 0.5) - playerLoc.getX();
+            double dy = (pos.y() + 0.5) - playerLoc.getY();
+            double dz = (pos.z() + 0.5) - playerLoc.getZ();
+            if ((dx * dx + dy * dy + dz * dz) > PARTICLE_PLAYER_RADIUS_SQUARED) {
+                continue;
+            }
+
+            Block block = world.getBlockAt(pos.x(), pos.y(), pos.z());
+            if (block.getType() != hostMaterial || !hasAirBelow(block)) {
+                continue;
+            }
+
+            seen.add(pos);
+            targets.add(pos);
+        }
+
+        return targets;
+    }
+
+    private boolean hasAirBelow(Block block) {
+        return block.getRelative(BlockFace.DOWN).getType().isAir();
     }
 }
