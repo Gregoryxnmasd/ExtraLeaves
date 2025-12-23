@@ -10,6 +10,7 @@ import org.bukkit.NamespacedKey;
 import org.bukkit.Particle;
 import org.bukkit.World;
 import org.bukkit.block.Block;
+import org.bukkit.block.BlockFace;
 import org.bukkit.block.data.BlockData;
 import org.bukkit.block.data.type.Leaves;
 import org.bukkit.configuration.ConfigurationSection;
@@ -54,7 +55,6 @@ public class LeafManager implements Listener {
     private static final int MAX_PARTICLES_PER_PLAYER = 3;
     private static final double PARTICLE_PLAYER_RADIUS = 32.0;
     private static final double PARTICLE_PLAYER_RADIUS_SQUARED = PARTICLE_PLAYER_RADIUS * PARTICLE_PLAYER_RADIUS;
-    private static final float PARTICLE_SIZE = 1.0f;
     private static final double PARTICLE_FALL_SPEED = 0.02;
     private static final double PARTICLE_DRIFT = 0.02;
     private static final double PARTICLE_DOWNWARD_SPEED = -0.04;
@@ -751,6 +751,9 @@ public class LeafManager implements Listener {
                 if (block.getType() != hostMaterial) {
                     continue;
                 }
+                if (!hasAirBelow(block)) {
+                    continue;
+                }
 
                 int amount = entry.type().particleAmount();
                 if (amount <= 0) continue;
@@ -791,7 +794,6 @@ public class LeafManager implements Listener {
 
     private void spawnLeafParticle(Player player, LeafType type, BlockKey pos, ThreadLocalRandom rnd) {
         Color color = type.particleColor();
-        Particle.DustOptions dust = new Particle.DustOptions(color, PARTICLE_SIZE);
 
         double x = pos.x() + 0.2 + rnd.nextDouble() * 0.6;
         double y = pos.y() - 0.2 + rnd.nextDouble() * 0.2;
@@ -811,7 +813,11 @@ public class LeafManager implements Listener {
                 vy,
                 vz,
                 1.0,
-                dust
+                color
         );
+    }
+
+    private boolean hasAirBelow(Block block) {
+        return block.getRelative(BlockFace.DOWN).getType().isAir();
     }
 }
