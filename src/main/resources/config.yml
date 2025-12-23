@@ -1,5 +1,11 @@
 namespace: "extraleaves"
 
+particles:
+  chunk-radius: 3
+  max-per-tick: 80
+  max-per-player: 10
+  player-radius: 48.0
+
 hand-drops:
   stick:
     material: "STICK"
@@ -20,6 +26,8 @@ leaves:
     distance-id: 1
     custom-model-data: 104001
     texture: "lavender_leaves"
+    particle-color: "#BFA6FF"
+    particle-amount: 1
 
   red_maple_leaves:
     id: "red_maple_leaves"
@@ -27,6 +35,8 @@ leaves:
     distance-id: 2
     custom-model-data: 104002
     texture: "red_maple_leaves"
+    particle-color: "#C64A3D"
+    particle-amount: 1
 
   orange_maple_leaves:
     id: "orange_maple_leaves"
@@ -34,6 +44,8 @@ leaves:
     distance-id: 3
     custom-model-data: 104003
     texture: "orange_maple_leaves"
+    particle-color: "#D98C2B"
+    particle-amount: 1
 
   yellow_maple_leaves:
     id: "yellow_maple_leaves"
@@ -41,3 +53,5 @@ leaves:
     distance-id: 4
     custom-model-data: 104004
     texture: "yellow_maple_leaves"
+    particle-color: "#E6D152"
+    particle-amount: 1
