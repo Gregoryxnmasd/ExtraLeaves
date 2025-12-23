@@ -55,6 +55,10 @@ public class LeafManager implements Listener {
     private static final double PARTICLE_PLAYER_RADIUS = 32.0;
     private static final double PARTICLE_PLAYER_RADIUS_SQUARED = PARTICLE_PLAYER_RADIUS * PARTICLE_PLAYER_RADIUS;
     private static final float PARTICLE_SIZE = 1.0f;
+    private static final double PARTICLE_FALL_SPEED = 0.02;
+    private static final double PARTICLE_DRIFT = 0.02;
+    private static final double PARTICLE_DOWNWARD_SPEED = -0.04;
+    private static final int PARTICLE_ATTEMPTS_MULTIPLIER = 4;
 
     // Bloque host real (Iris + plugin usan AZALEA_LEAVES)
     private final Material hostMaterial = Material.AZALEA_LEAVES;
@@ -716,7 +720,8 @@ public class LeafManager implements Listener {
             int baseChunkZ = playerLoc.getBlockZ() >> 4;
 
             int perPlayer = Math.min(MAX_PARTICLES_PER_PLAYER, remaining);
-            for (int attempt = 0; attempt < perPlayer; attempt++) {
+            int attempts = perPlayer * PARTICLE_ATTEMPTS_MULTIPLIER;
+            for (int attempt = 0; attempt < attempts; attempt++) {
                 int cx = baseChunkX + rnd.nextInt(-PARTICLE_CHUNK_RADIUS, PARTICLE_CHUNK_RADIUS + 1);
                 int cz = baseChunkZ + rnd.nextInt(-PARTICLE_CHUNK_RADIUS, PARTICLE_CHUNK_RADIUS + 1);
                 Map<BlockKey, LeafEntry> map = leavesByChunk.get(new ChunkKey(world.getUID(), cx, cz));
@@ -735,8 +740,10 @@ public class LeafManager implements Listener {
                 }
 
                 BlockKey pos = selection.getKey();
-                if (playerLoc.distanceSquared(new Location(world, pos.x() + 0.5, pos.y() + 0.5, pos.z() + 0.5))
-                        > PARTICLE_PLAYER_RADIUS_SQUARED) {
+                double dx = (pos.x() + 0.5) - playerLoc.getX();
+                double dy = (pos.y() + 0.5) - playerLoc.getY();
+                double dz = (pos.z() + 0.5) - playerLoc.getZ();
+                if ((dx * dx + dy * dy + dz * dz) > PARTICLE_PLAYER_RADIUS_SQUARED) {
                     continue;
                 }
 
@@ -745,16 +752,25 @@ public class LeafManager implements Listener {
                     continue;
                 }
 
-                int amount = Math.min(entry.type().particleAmount(), remaining);
-                if (amount <= 0) {
-                    continue;
-                }
+                int amount = entry.type().particleAmount();
+                if (amount <= 0) continue;
 
-                for (int i = 0; i < amount; i++) {
+                int spawnCount = 1;
+                if (amount > 1) {
+                    spawnCount = 1 + rnd.nextInt(amount);
+                }
+                spawnCount = Math.min(spawnCount, remaining);
+
+                for (int i = 0; i < spawnCount; i++) {
                     spawnLeafParticle(player, entry.type(), pos, rnd);
                 }
-                remaining -= amount;
+                remaining -= spawnCount;
                 if (remaining <= 0) {
+                    break;
+                }
+
+                perPlayer--;
+                if (perPlayer <= 0) {
                     break;
                 }
             }
@@ -777,20 +793,24 @@ public class LeafManager implements Listener {
         Color color = type.particleColor();
         Particle.DustOptions dust = new Particle.DustOptions(color, PARTICLE_SIZE);
 
-        double x = pos.x() + 0.25 + rnd.nextDouble() * 0.5;
-        double y = pos.y() + 0.2 + rnd.nextDouble() * 0.6;
-        double z = pos.z() + 0.25 + rnd.nextDouble() * 0.5;
+        double x = pos.x() + 0.2 + rnd.nextDouble() * 0.6;
+        double y = pos.y() - 0.2 + rnd.nextDouble() * 0.2;
+        double z = pos.z() + 0.2 + rnd.nextDouble() * 0.6;
+
+        double vx = (rnd.nextDouble() - 0.5) * PARTICLE_DRIFT;
+        double vz = (rnd.nextDouble() - 0.5) * PARTICLE_DRIFT;
+        double vy = PARTICLE_DOWNWARD_SPEED - rnd.nextDouble() * PARTICLE_FALL_SPEED;
 
         player.spawnParticle(
-                Particle.DUST,
+                Particle.TINTED_LEAVES,
                 x,
                 y,
                 z,
-                1,
-                0.05,
-                0.1,
-                0.05,
-                0.0,
+                0,
+                vx,
+                vy,
+                vz,
+                1.0,
                 dust
         );
     }
