@@ -1,5 +1,11 @@
 namespace: "extraleaves"
 
+particles:
+  chunk-radius: 3
+  max-per-tick: 80
+  max-per-player: 10
+  player-radius: 48.0
+
 hand-drops:
   stick:
     material: "STICK"

@@ -49,16 +49,17 @@ public class LeafManager implements Listener {
     private static final int RESKIN_VIEW_RADIUS = 32;
     private static final int MAX_RESENDS_PER_TICK = 800;
 
-    private static final int PARTICLE_TICK_INTERVAL = 5;
-    private static final int PARTICLE_CHUNK_RADIUS = 3;
-    private static final int MAX_PARTICLES_PER_TICK = 40;
-    private static final int MAX_PARTICLES_PER_PLAYER = 3;
-    private static final double PARTICLE_PLAYER_RADIUS = 48.0;
-    private static final double PARTICLE_PLAYER_RADIUS_SQUARED = PARTICLE_PLAYER_RADIUS * PARTICLE_PLAYER_RADIUS;
+    private static final int PARTICLE_TICK_INTERVAL = 1;
     private static final double PARTICLE_FALL_SPEED = 0.02;
     private static final double PARTICLE_DRIFT = 0.02;
     private static final double PARTICLE_DOWNWARD_SPEED = -0.04;
     private static final int PARTICLE_ATTEMPTS_MULTIPLIER = 4;
+
+    private int particleChunkRadius = 3;
+    private int maxParticlesPerTick = 40;
+    private int maxParticlesPerPlayer = 3;
+    private double particlePlayerRadius = 48.0;
+    private double particlePlayerRadiusSquared = particlePlayerRadius * particlePlayerRadius;
 
     // Bloque host real (Iris + plugin usan AZALEA_LEAVES)
     private final Material hostMaterial = Material.AZALEA_LEAVES;
@@ -105,6 +106,7 @@ public class LeafManager implements Listener {
 
         loadConfigLeaves();
         loadHandDropsFromConfig();
+        loadParticleSettings();
 
         Bukkit.getPluginManager().registerEvents(this, plugin);
 
@@ -253,6 +255,25 @@ public class LeafManager implements Listener {
         plugin.getLogger().info("ExtraLeaves: cargados " + handDrops.size() + " drops de mano.");
     }
 
+    private void loadParticleSettings() {
+        FileConfiguration cfg = plugin.getConfig();
+        ConfigurationSection sec = cfg.getConfigurationSection("particles");
+        if (sec == null) {
+            particleChunkRadius = 3;
+            maxParticlesPerTick = 40;
+            maxParticlesPerPlayer = 3;
+            particlePlayerRadius = 48.0;
+            particlePlayerRadiusSquared = particlePlayerRadius * particlePlayerRadius;
+            return;
+        }
+
+        particleChunkRadius = Math.max(1, sec.getInt("chunk-radius", 3));
+        maxParticlesPerTick = Math.max(1, sec.getInt("max-per-tick", 40));
+        maxParticlesPerPlayer = Math.max(1, sec.getInt("max-per-player", 3));
+        particlePlayerRadius = Math.max(8.0, sec.getDouble("player-radius", 48.0));
+        particlePlayerRadiusSquared = particlePlayerRadius * particlePlayerRadius;
+    }
+
     public void reload() {
         byId.clear();
         byDistance.clear();
@@ -263,6 +284,7 @@ public class LeafManager implements Listener {
         plugin.reloadConfig();
         loadConfigLeaves();
         loadHandDropsFromConfig();
+        loadParticleSettings();
         rebuildLoadedChunks();
     }
 
@@ -741,7 +763,7 @@ public class LeafManager implements Listener {
             return;
         }
 
-        int remaining = MAX_PARTICLES_PER_TICK;
+        int remaining = maxParticlesPerTick;
         ThreadLocalRandom rnd = ThreadLocalRandom.current();
 
         for (Player player : players) {
@@ -759,11 +781,11 @@ public class LeafManager implements Listener {
             int baseChunkX = playerLoc.getBlockX() >> 4;
             int baseChunkZ = playerLoc.getBlockZ() >> 4;
 
-            int perPlayer = Math.min(MAX_PARTICLES_PER_PLAYER, remaining);
+            int perPlayer = Math.min(maxParticlesPerPlayer, remaining);
             int attempts = perPlayer * PARTICLE_ATTEMPTS_MULTIPLIER;
             for (int attempt = 0; attempt < attempts; attempt++) {
-                int cx = baseChunkX + rnd.nextInt(-PARTICLE_CHUNK_RADIUS, PARTICLE_CHUNK_RADIUS + 1);
-                int cz = baseChunkZ + rnd.nextInt(-PARTICLE_CHUNK_RADIUS, PARTICLE_CHUNK_RADIUS + 1);
+                int cx = baseChunkX + rnd.nextInt(-particleChunkRadius, particleChunkRadius + 1);
+                int cz = baseChunkZ + rnd.nextInt(-particleChunkRadius, particleChunkRadius + 1);
                 Map<BlockKey, LeafEntry> map = customLeavesByChunk.get(new ChunkKey(world.getUID(), cx, cz));
                 if (map == null || map.isEmpty()) {
                     continue;
@@ -780,7 +802,7 @@ public class LeafManager implements Listener {
                 double dx = (pos.x() + 0.5) - playerLoc.getX();
                 double dy = (pos.y() + 0.5) - playerLoc.getY();
                 double dz = (pos.z() + 0.5) - playerLoc.getZ();
-                if ((dx * dx + dy * dy + dz * dz) > PARTICLE_PLAYER_RADIUS_SQUARED) {
+                if ((dx * dx + dy * dy + dz * dz) > particlePlayerRadiusSquared) {
                     continue;
                 }
 
@@ -861,8 +883,8 @@ public class LeafManager implements Listener {
 
         int attempts = count * PARTICLE_ATTEMPTS_MULTIPLIER;
         for (int attempt = 0; attempt < attempts && targets.size() < count; attempt++) {
-            int cx = baseChunkX + rnd.nextInt(-PARTICLE_CHUNK_RADIUS, PARTICLE_CHUNK_RADIUS + 1);
-            int cz = baseChunkZ + rnd.nextInt(-PARTICLE_CHUNK_RADIUS, PARTICLE_CHUNK_RADIUS + 1);
+            int cx = baseChunkX + rnd.nextInt(-particleChunkRadius, particleChunkRadius + 1);
+            int cz = baseChunkZ + rnd.nextInt(-particleChunkRadius, particleChunkRadius + 1);
             Map<BlockKey, LeafEntry> map = customLeavesByChunk.get(new ChunkKey(world.getUID(), cx, cz));
             if (map == null || map.isEmpty()) {
                 continue;
@@ -886,7 +908,7 @@ public class LeafManager implements Listener {
             double dx = (pos.x() + 0.5) - playerLoc.getX();
             double dy = (pos.y() + 0.5) - playerLoc.getY();
             double dz = (pos.z() + 0.5) - playerLoc.getZ();
-            if ((dx * dx + dy * dy + dz * dz) > PARTICLE_PLAYER_RADIUS_SQUARED) {
+            if ((dx * dx + dy * dy + dz * dz) > particlePlayerRadiusSquared) {
                 continue;
             }
 
