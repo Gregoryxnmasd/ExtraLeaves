@@ -3,11 +3,14 @@ package com.extracraft.extraleaves;
 import org.bukkit.Bukkit;
 import org.bukkit.ChatColor;
 import org.bukkit.Chunk;
+import org.bukkit.Color;
 import org.bukkit.Location;
 import org.bukkit.Material;
 import org.bukkit.NamespacedKey;
+import org.bukkit.Particle;
 import org.bukkit.World;
 import org.bukkit.block.Block;
+import org.bukkit.block.BlockFace;
 import org.bukkit.block.data.BlockData;
 import org.bukkit.block.data.type.Leaves;
 import org.bukkit.configuration.ConfigurationSection;
@@ -46,6 +49,19 @@ public class LeafManager implements Listener {
     private static final int RESKIN_VIEW_RADIUS = 32;
     private static final int MAX_RESENDS_PER_TICK = 800;
 
+    private static final int PARTICLE_TICK_INTERVAL = 1;
+    private static final double PARTICLE_FALL_SPEED = 0.02;
+    private static final double PARTICLE_DRIFT = 0.02;
+    private static final double PARTICLE_DOWNWARD_SPEED = -0.04;
+    private static final int PARTICLE_ATTEMPTS_MULTIPLIER = 4;
+
+    private int particleChunkRadius = 3;
+    private int maxParticlesPerTick = 40;
+    private int maxParticlesPerPlayer = 3;
+    private double particlePlayerRadius = 48.0;
+    private double particlePlayerRadiusSquared = particlePlayerRadius * particlePlayerRadius;
+    private int maxParticleAmount = 1;
+
     // Bloque host real (Iris + plugin usan AZALEA_LEAVES)
     private final Material hostMaterial = Material.AZALEA_LEAVES;
 
@@ -59,6 +75,8 @@ public class LeafManager implements Listener {
 
     // ChunkKey -> (BlockKey -> LeafEntry)
     private final Map<ChunkKey, Map<BlockKey, LeafEntry>> leavesByChunk = new HashMap<>();
+    // ChunkKey -> (BlockKey -> LeafEntry) hojas que pueden emitir partículas
+    private final Map<ChunkKey, Map<BlockKey, LeafEntry>> particleLeavesByChunk = new HashMap<>();
 
     // Drops al romper con la mano
     private static class HandDrop {
@@ -89,6 +107,7 @@ public class LeafManager implements Listener {
 
         loadConfigLeaves();
         loadHandDropsFromConfig();
+        loadParticleSettings();
 
         Bukkit.getPluginManager().registerEvents(this, plugin);
 
@@ -97,6 +116,9 @@ public class LeafManager implements Listener {
 
         // Reloj ligero para procesar la cola de repintados sin burst masivos
         Bukkit.getScheduler().runTaskTimer(plugin, this::processReskinQueue, 1L, 1L);
+
+        // Partículas suaves de hojas cayendo (solo hojas colocadas)
+        Bukkit.getScheduler().runTaskTimer(plugin, this::spawnLeafParticles, PARTICLE_TICK_INTERVAL, PARTICLE_TICK_INTERVAL);
     }
 
     // ==================== CONFIG ====================
@@ -114,6 +136,7 @@ public class LeafManager implements Listener {
             return;
         }
 
+        maxParticleAmount = 1;
         for (String key : sec.getKeys(false)) {
             ConfigurationSection leafSec = sec.getConfigurationSection(key);
             if (leafSec == null) continue;
@@ -123,6 +146,8 @@ public class LeafManager implements Listener {
             String texture = leafSec.getString("texture", id);
             int distanceId = leafSec.getInt("distance-id", 2);
             int customModelData = leafSec.getInt("custom-model-data", 0);
+            Color particleColor = parseParticleColor(leafSec.getString("particle-color", "#FFFFFF"), id);
+            int particleAmount = Math.max(0, leafSec.getInt("particle-amount", 1));
 
             if (distanceId < 1 || distanceId > 7) {
                 plugin.getLogger().warning("distance-id inválido en " + id + " (1..7). Se ignora.");
@@ -149,14 +174,52 @@ public class LeafManager implements Listener {
                     distanceId,
                     texture,
                     customModelData,
-                    visual
+                    visual,
+                    particleColor,
+                    particleAmount
             );
 
             byId.put(type.id(), type);
             byDistance.put(distanceId, type);
+            maxParticleAmount = Math.max(maxParticleAmount, particleAmount);
         }
 
         plugin.getLogger().info("ExtraLeaves: cargados " + byId.size() + " tipos de hojas.");
+    }
+
+    private Color parseParticleColor(String raw, String leafId) {
+        if (raw == null || raw.isBlank()) {
+            return Color.WHITE;
+        }
+
+        String trimmed = raw.trim();
+        if (trimmed.startsWith("#")) {
+            trimmed = trimmed.substring(1);
+        }
+
+        if (trimmed.matches("(?i)[0-9a-f]{6}")) {
+            int rgb = Integer.parseInt(trimmed, 16);
+            return Color.fromRGB(rgb);
+        }
+
+        String[] parts = trimmed.split(",");
+        if (parts.length == 3) {
+            try {
+                int r = clampColorComponent(Integer.parseInt(parts[0].trim()));
+                int g = clampColorComponent(Integer.parseInt(parts[1].trim()));
+                int b = clampColorComponent(Integer.parseInt(parts[2].trim()));
+                return Color.fromRGB(r, g, b);
+            } catch (NumberFormatException ignored) {
+                // fallback below
+            }
+        }
+
+        plugin.getLogger().warning("particle-color inválido para " + leafId + ": " + raw + " (usando blanco).");
+        return Color.WHITE;
+    }
+
+    private int clampColorComponent(int value) {
+        return Math.max(0, Math.min(255, value));
     }
 
     private void loadHandDropsFromConfig() {
@@ -195,15 +258,36 @@ public class LeafManager implements Listener {
         plugin.getLogger().info("ExtraLeaves: cargados " + handDrops.size() + " drops de mano.");
     }
 
+    private void loadParticleSettings() {
+        FileConfiguration cfg = plugin.getConfig();
+        ConfigurationSection sec = cfg.getConfigurationSection("particles");
+        if (sec == null) {
+            particleChunkRadius = 3;
+            maxParticlesPerTick = 40;
+            maxParticlesPerPlayer = 3;
+            particlePlayerRadius = 48.0;
+            particlePlayerRadiusSquared = particlePlayerRadius * particlePlayerRadius;
+            return;
+        }
+
+        particleChunkRadius = Math.max(1, sec.getInt("chunk-radius", 3));
+        maxParticlesPerTick = Math.max(1, sec.getInt("max-per-tick", 40));
+        maxParticlesPerPlayer = Math.max(1, sec.getInt("max-per-player", 3));
+        particlePlayerRadius = Math.max(8.0, sec.getDouble("player-radius", 48.0));
+        particlePlayerRadiusSquared = particlePlayerRadius * particlePlayerRadius;
+    }
+
     public void reload() {
         byId.clear();
         byDistance.clear();
         leavesByChunk.clear();
+        particleLeavesByChunk.clear();
         handDrops.clear();
 
         plugin.reloadConfig();
         loadConfigLeaves();
         loadHandDropsFromConfig();
+        loadParticleSettings();
         rebuildLoadedChunks();
     }
 
@@ -278,6 +362,20 @@ public class LeafManager implements Listener {
         LeafEntry previous = map.put(pos, new LeafEntry(type, persistent));
         applyLeafState(block, type);
 
+        if (persistent) {
+            particleLeavesByChunk
+                    .computeIfAbsent(chunkKey(chunk), key -> new HashMap<>())
+                    .put(pos, new LeafEntry(type, true));
+        } else {
+            Map<BlockKey, LeafEntry> particleMap = particleLeavesByChunk.get(chunkKey(chunk));
+            if (particleMap != null) {
+                particleMap.remove(pos);
+                if (particleMap.isEmpty()) {
+                    particleLeavesByChunk.remove(chunkKey(chunk));
+                }
+            }
+        }
+
         if (!savePersistentChanges) {
             return;
         }
@@ -298,6 +396,13 @@ public class LeafManager implements Listener {
         if (map == null) return;
 
         LeafEntry removed = map.remove(blockPos(block));
+        Map<BlockKey, LeafEntry> particleMap = particleLeavesByChunk.get(chunkKey(chunk));
+        if (particleMap != null) {
+            particleMap.remove(blockPos(block));
+            if (particleMap.isEmpty()) {
+                particleLeavesByChunk.remove(chunkKey(chunk));
+            }
+        }
         if (removed != null && removed.persistent()) {
             saveChunkData(chunk, map);
         }
@@ -424,14 +529,20 @@ public class LeafManager implements Listener {
 
         Map<BlockKey, LeafEntry> map = loadChunkData(chunk);
         leavesByChunk.put(key, map);
+        Map<BlockKey, LeafEntry> particleMap = extractPersistentLeaves(map);
+        if (!particleMap.isEmpty()) {
+            particleLeavesByChunk.put(key, particleMap);
+        }
 
         // Detectar hojas de Iris sin persistirlas
-        scanChunkForHostLeaves(chunk, map);
+        scanChunkForHostLeaves(chunk, map, particleMap);
     }
 
     @EventHandler
     public void onChunkUnload(ChunkUnloadEvent event) {
-        leavesByChunk.remove(chunkKey(event.getChunk()));
+        ChunkKey key = chunkKey(event.getChunk());
+        leavesByChunk.remove(key);
+        particleLeavesByChunk.remove(key);
     }
 
     @EventHandler
@@ -445,7 +556,7 @@ public class LeafManager implements Listener {
      * Escanea un chunk para encontrar AZALEA_LEAVES de Iris y registrarlas si
      * aún no están en el mapa (no pisa hojas ya registradas por jugadores).
      */
-    private void scanChunkForHostLeaves(Chunk chunk, Map<BlockKey, LeafEntry> map) {
+    private void scanChunkForHostLeaves(Chunk chunk, Map<BlockKey, LeafEntry> map, Map<BlockKey, LeafEntry> particleMap) {
         World world = chunk.getWorld();
 
         int minY = world.getMinHeight();
@@ -471,9 +582,11 @@ public class LeafManager implements Listener {
 
                     BlockData data = block.getBlockData();
                     LeafType type = null;
+                    boolean matchedDistance = false;
 
                     if (data instanceof Leaves leaves) {
                         type = byDistance.get(leaves.getDistance());
+                        matchedDistance = (type != null);
                     }
 
                     if (type == null && !byId.isEmpty()) {
@@ -483,6 +596,9 @@ public class LeafManager implements Listener {
                     if (type != null) {
                         map.put(pos, new LeafEntry(type, false));
                         applyLeafState(block, type);
+                        if (matchedDistance) {
+                            particleMap.put(pos, new LeafEntry(type, false));
+                        }
                     }
                 }
             }
@@ -557,6 +673,7 @@ public class LeafManager implements Listener {
         for (World world : Bukkit.getWorlds()) {
             for (Chunk chunk : world.getLoadedChunks()) {
                 leavesByChunk.remove(chunkKey(chunk));
+                particleLeavesByChunk.remove(chunkKey(chunk));
                 ChunkLoadEvent fake = new ChunkLoadEvent(chunk, false);
                 onChunkLoad(fake);
             }
@@ -611,6 +728,16 @@ public class LeafManager implements Listener {
         return map;
     }
 
+    private Map<BlockKey, LeafEntry> extractPersistentLeaves(Map<BlockKey, LeafEntry> map) {
+        Map<BlockKey, LeafEntry> particleMap = new HashMap<>();
+        for (Map.Entry<BlockKey, LeafEntry> entry : map.entrySet()) {
+            if (entry.getValue().persistent()) {
+                particleMap.put(entry.getKey(), entry.getValue());
+            }
+        }
+        return particleMap;
+    }
+
     /**
      * Fallback manual refresher usado por comandos o depuración externa.
      * Reaplica el estado custom a todas las hojas rastreadas en chunks cargados.
@@ -633,5 +760,138 @@ public class LeafManager implements Listener {
                 applyLeafState(world.getBlockAt(pos.x(), pos.y(), pos.z()), leafEntry.type());
             }
         }
+    }
+
+    private void spawnLeafParticles() {
+        if (particleLeavesByChunk.isEmpty()) {
+            return;
+        }
+
+        Collection<? extends Player> players = Bukkit.getOnlinePlayers();
+        if (players.isEmpty()) {
+            return;
+        }
+
+        int remaining = maxParticlesPerTick;
+        ThreadLocalRandom rnd = ThreadLocalRandom.current();
+
+        for (Player player : players) {
+            if (remaining <= 0) {
+                break;
+            }
+            if (!player.isOnline() || player.isDead()) {
+                continue;
+            }
+
+            Location playerLoc = player.getLocation();
+            World world = playerLoc.getWorld();
+            if (world == null) continue;
+
+            int baseChunkX = playerLoc.getBlockX() >> 4;
+            int baseChunkZ = playerLoc.getBlockZ() >> 4;
+
+            int perPlayer = Math.min(maxParticlesPerPlayer, remaining);
+            int attempts = perPlayer * PARTICLE_ATTEMPTS_MULTIPLIER;
+            Set<BlockKey> used = new HashSet<>(perPlayer * 2);
+            for (int attempt = 0; attempt < attempts; attempt++) {
+                int cx = baseChunkX + rnd.nextInt(-particleChunkRadius, particleChunkRadius + 1);
+                int cz = baseChunkZ + rnd.nextInt(-particleChunkRadius, particleChunkRadius + 1);
+                Map<BlockKey, LeafEntry> map = particleLeavesByChunk.get(new ChunkKey(world.getUID(), cx, cz));
+                if (map == null || map.isEmpty()) {
+                    continue;
+                }
+
+                Map.Entry<BlockKey, LeafEntry> selection = pickRandomLeaf(map, rnd);
+                if (selection == null) {
+                    continue;
+                }
+
+                LeafEntry entry = selection.getValue();
+
+                BlockKey pos = selection.getKey();
+                if (used.contains(pos)) {
+                    continue;
+                }
+                double dx = (pos.x() + 0.5) - playerLoc.getX();
+                double dy = (pos.y() + 0.5) - playerLoc.getY();
+                double dz = (pos.z() + 0.5) - playerLoc.getZ();
+                if ((dx * dx + dy * dy + dz * dz) > particlePlayerRadiusSquared) {
+                    continue;
+                }
+
+                Block block = world.getBlockAt(pos.x(), pos.y(), pos.z());
+                if (block.getType() != hostMaterial) {
+                    continue;
+                }
+                if (!hasAirBelow(block)) {
+                    continue;
+                }
+
+                if (!shouldSpawnParticle(entry.type(), rnd)) {
+                    continue;
+                }
+
+                spawnLeafParticle(player, entry.type(), pos, rnd);
+                used.add(pos);
+                remaining--;
+                perPlayer--;
+                if (remaining <= 0) {
+                    break;
+                }
+                if (perPlayer <= 0) {
+                    break;
+                }
+            }
+        }
+    }
+
+    private Map.Entry<BlockKey, LeafEntry> pickRandomLeaf(Map<BlockKey, LeafEntry> map, ThreadLocalRandom rnd) {
+        if (map.isEmpty()) return null;
+        int target = rnd.nextInt(map.size());
+        int index = 0;
+        for (Map.Entry<BlockKey, LeafEntry> entry : map.entrySet()) {
+            if (index++ == target) {
+                return entry;
+            }
+        }
+        return null;
+    }
+
+    private void spawnLeafParticle(Player player, LeafType type, BlockKey pos, ThreadLocalRandom rnd) {
+        Color color = type.particleColor();
+
+        double x = pos.x() + 0.2 + rnd.nextDouble() * 0.6;
+        double y = pos.y() - 0.2 + rnd.nextDouble() * 0.2;
+        double z = pos.z() + 0.2 + rnd.nextDouble() * 0.6;
+
+        double vx = (rnd.nextDouble() - 0.5) * PARTICLE_DRIFT;
+        double vz = (rnd.nextDouble() - 0.5) * PARTICLE_DRIFT;
+        double vy = PARTICLE_DOWNWARD_SPEED - rnd.nextDouble() * PARTICLE_FALL_SPEED;
+
+        player.spawnParticle(
+                Particle.TINTED_LEAVES,
+                x,
+                y,
+                z,
+                0,
+                vx,
+                vy,
+                vz,
+                1.0,
+                color
+        );
+    }
+
+    private boolean hasAirBelow(Block block) {
+        return block.getRelative(BlockFace.DOWN).getType().isAir();
+    }
+
+    private boolean shouldSpawnParticle(LeafType type, ThreadLocalRandom rnd) {
+        int amount = type.particleAmount();
+        if (amount <= 0) {
+            return false;
+        }
+        int max = Math.max(1, maxParticleAmount);
+        return rnd.nextInt(max) < amount;
     }
 }
