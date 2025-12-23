@@ -75,8 +75,8 @@ public class LeafManager implements Listener {
 
     // ChunkKey -> (BlockKey -> LeafEntry)
     private final Map<ChunkKey, Map<BlockKey, LeafEntry>> leavesByChunk = new HashMap<>();
-    // ChunkKey -> (BlockKey -> LeafEntry) solo hojas colocadas por jugador
-    private final Map<ChunkKey, Map<BlockKey, LeafEntry>> customLeavesByChunk = new HashMap<>();
+    // ChunkKey -> (BlockKey -> LeafEntry) hojas que pueden emitir partículas
+    private final Map<ChunkKey, Map<BlockKey, LeafEntry>> particleLeavesByChunk = new HashMap<>();
 
     // Drops al romper con la mano
     private static class HandDrop {
@@ -281,7 +281,7 @@ public class LeafManager implements Listener {
         byId.clear();
         byDistance.clear();
         leavesByChunk.clear();
-        customLeavesByChunk.clear();
+        particleLeavesByChunk.clear();
         handDrops.clear();
 
         plugin.reloadConfig();
@@ -363,15 +363,15 @@ public class LeafManager implements Listener {
         applyLeafState(block, type);
 
         if (persistent) {
-            customLeavesByChunk
+            particleLeavesByChunk
                     .computeIfAbsent(chunkKey(chunk), key -> new HashMap<>())
                     .put(pos, new LeafEntry(type, true));
         } else {
-            Map<BlockKey, LeafEntry> customMap = customLeavesByChunk.get(chunkKey(chunk));
-            if (customMap != null) {
-                customMap.remove(pos);
-                if (customMap.isEmpty()) {
-                    customLeavesByChunk.remove(chunkKey(chunk));
+            Map<BlockKey, LeafEntry> particleMap = particleLeavesByChunk.get(chunkKey(chunk));
+            if (particleMap != null) {
+                particleMap.remove(pos);
+                if (particleMap.isEmpty()) {
+                    particleLeavesByChunk.remove(chunkKey(chunk));
                 }
             }
         }
@@ -396,11 +396,11 @@ public class LeafManager implements Listener {
         if (map == null) return;
 
         LeafEntry removed = map.remove(blockPos(block));
-        Map<BlockKey, LeafEntry> customMap = customLeavesByChunk.get(chunkKey(chunk));
-        if (customMap != null) {
-            customMap.remove(blockPos(block));
-            if (customMap.isEmpty()) {
-                customLeavesByChunk.remove(chunkKey(chunk));
+        Map<BlockKey, LeafEntry> particleMap = particleLeavesByChunk.get(chunkKey(chunk));
+        if (particleMap != null) {
+            particleMap.remove(blockPos(block));
+            if (particleMap.isEmpty()) {
+                particleLeavesByChunk.remove(chunkKey(chunk));
             }
         }
         if (removed != null && removed.persistent()) {
@@ -529,20 +529,20 @@ public class LeafManager implements Listener {
 
         Map<BlockKey, LeafEntry> map = loadChunkData(chunk);
         leavesByChunk.put(key, map);
-        Map<BlockKey, LeafEntry> customMap = extractPersistentLeaves(map);
-        if (!customMap.isEmpty()) {
-            customLeavesByChunk.put(key, customMap);
+        Map<BlockKey, LeafEntry> particleMap = extractPersistentLeaves(map);
+        if (!particleMap.isEmpty()) {
+            particleLeavesByChunk.put(key, particleMap);
         }
 
         // Detectar hojas de Iris sin persistirlas
-        scanChunkForHostLeaves(chunk, map);
+        scanChunkForHostLeaves(chunk, map, particleMap);
     }
 
     @EventHandler
     public void onChunkUnload(ChunkUnloadEvent event) {
         ChunkKey key = chunkKey(event.getChunk());
         leavesByChunk.remove(key);
-        customLeavesByChunk.remove(key);
+        particleLeavesByChunk.remove(key);
     }
 
     @EventHandler
@@ -556,7 +556,7 @@ public class LeafManager implements Listener {
      * Escanea un chunk para encontrar AZALEA_LEAVES de Iris y registrarlas si
      * aún no están en el mapa (no pisa hojas ya registradas por jugadores).
      */
-    private void scanChunkForHostLeaves(Chunk chunk, Map<BlockKey, LeafEntry> map) {
+    private void scanChunkForHostLeaves(Chunk chunk, Map<BlockKey, LeafEntry> map, Map<BlockKey, LeafEntry> particleMap) {
         World world = chunk.getWorld();
 
         int minY = world.getMinHeight();
@@ -582,9 +582,11 @@ public class LeafManager implements Listener {
 
                     BlockData data = block.getBlockData();
                     LeafType type = null;
+                    boolean matchedDistance = false;
 
                     if (data instanceof Leaves leaves) {
                         type = byDistance.get(leaves.getDistance());
+                        matchedDistance = (type != null);
                     }
 
                     if (type == null && !byId.isEmpty()) {
@@ -594,6 +596,9 @@ public class LeafManager implements Listener {
                     if (type != null) {
                         map.put(pos, new LeafEntry(type, false));
                         applyLeafState(block, type);
+                        if (matchedDistance) {
+                            particleMap.put(pos, new LeafEntry(type, false));
+                        }
                     }
                 }
             }
@@ -668,6 +673,7 @@ public class LeafManager implements Listener {
         for (World world : Bukkit.getWorlds()) {
             for (Chunk chunk : world.getLoadedChunks()) {
                 leavesByChunk.remove(chunkKey(chunk));
+                particleLeavesByChunk.remove(chunkKey(chunk));
                 ChunkLoadEvent fake = new ChunkLoadEvent(chunk, false);
                 onChunkLoad(fake);
             }
@@ -723,13 +729,13 @@ public class LeafManager implements Listener {
     }
 
     private Map<BlockKey, LeafEntry> extractPersistentLeaves(Map<BlockKey, LeafEntry> map) {
-        Map<BlockKey, LeafEntry> customMap = new HashMap<>();
+        Map<BlockKey, LeafEntry> particleMap = new HashMap<>();
         for (Map.Entry<BlockKey, LeafEntry> entry : map.entrySet()) {
             if (entry.getValue().persistent()) {
-                customMap.put(entry.getKey(), entry.getValue());
+                particleMap.put(entry.getKey(), entry.getValue());
             }
         }
-        return customMap;
+        return particleMap;
     }
 
     /**
@@ -757,7 +763,7 @@ public class LeafManager implements Listener {
     }
 
     private void spawnLeafParticles() {
-        if (customLeavesByChunk.isEmpty()) {
+        if (particleLeavesByChunk.isEmpty()) {
             return;
         }
 
@@ -790,7 +796,7 @@ public class LeafManager implements Listener {
             for (int attempt = 0; attempt < attempts; attempt++) {
                 int cx = baseChunkX + rnd.nextInt(-particleChunkRadius, particleChunkRadius + 1);
                 int cz = baseChunkZ + rnd.nextInt(-particleChunkRadius, particleChunkRadius + 1);
-                Map<BlockKey, LeafEntry> map = customLeavesByChunk.get(new ChunkKey(world.getUID(), cx, cz));
+                Map<BlockKey, LeafEntry> map = particleLeavesByChunk.get(new ChunkKey(world.getUID(), cx, cz));
                 if (map == null || map.isEmpty()) {
                     continue;
                 }
